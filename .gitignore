@@ -1,0 +1,52 @@
+# Build outputs
+build/
+build2/
+build_msvc/
+build_py/
+build_release/
+debug/
+release/
+
+# Visual Studio
+.vs/
+*.user
+*.aps
+*.qtvscr
+
+# Qt Creator
+*.pro.user
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+
+# Generated
+ui_mainwindow.h
+
+# Object files
+*.obj
+*.o
+
+# Python
+__pycache__/
+*.pyc
+
+# Misc
+stdout.txt
+stderr.txt
+
+# Installer
+installer_create/
+
+# Claude
+.claude/
+CLAUDE.md
+
+# Website
+website/
+
+#git
+.gitignore
+
+#others
+SCUT校园网DrCOM认证流程.md
+needcommit.md
