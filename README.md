@@ -32,13 +32,6 @@
 
 连接成功后程序可最小化到系统托盘后台运行。
 
-### 命令行参数
-
-```bash
-SCUTNetLogin.exe --silent     # 静默启动，隐藏窗口，自动连接
-SCUTNetLogin.exe -s           # 同上
-```
-
 ### 配置项说明
 
 | 配置项 | 说明 |
@@ -91,52 +84,3 @@ autoConnect=false
 | 打开网卡失败 | Npcap 未安装或网卡被其他程序占用 |
 
 ---
-
-## 从源码构建
-
-### 依赖
-
-| 依赖 | 版本 / 说明 |
-|------|-------------|
-| Visual Studio 2022 | MSVC v143 工具链 |
-| Qt | 6.11.0（msvc2022_64） |
-| [Npcap SDK](https://npcap.com/#download) | 安装到 `C:/npcap-sdk/` |
-
-### 构建
-
-```bash
-# 1. 生成 VS 解决方案
-qmake -tp vc SCUTNetLogin.pro -spec win32-msvc CONFIG+=release
-
-# 2. 打开 SCUTNetLogin.sln，Visual Studio 中选择 Release | x64 生成
-
-# 3. 部署 Qt 依赖
-windeployqt --release --no-compiler-runtime release/SCUTNetLogin.exe
-```
-
-### 项目结构
-
-```
-SCUTnetwork/
-├── src/
-│   ├── main.cpp              # 入口，命令行解析
-│   ├── mainwindow.h/cpp      # 主窗口、状态管理
-│   ├── mainwindow.ui         # Qt Designer 布局
-│   ├── eap_process.h/cpp     # 802.1X/EAPOL 认证
-│   ├── udp_process.h/cpp     # DrCOM UDP 心跳
-│   ├── network.h/cpp         # 网卡查找、netsh 操作
-│   ├── protocol.h            # 协议结构体定义
-│   ├── constants.h           # 协议常量与配置默认值
-│   └── app.rc                # 应用图标资源
-├── res/
-│   ├── resources.qrc         # Qt 资源索引
-│   ├── style.qss             # 全局样式表
-│   ├── SCUTnetwork.ico       # 应用图标
-│   └── check.svg             # 复选框图标
-├── SCUTNetLogin.pro          # qmake 项目文件
-└── README.md
-```
-
-## 开源协议
-
-MIT License
