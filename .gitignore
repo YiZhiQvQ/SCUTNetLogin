@@ -12,6 +12,9 @@ release/
 *.user
 *.aps
 *.qtvscr
+*.sln
+*.vcxproj
+*.vcxproj.filters
 
 # Qt Creator
 *.pro.user
