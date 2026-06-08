@@ -7,6 +7,12 @@ build_release/
 debug/
 release/
 
+# qmake artifacts
+.qmake.stash
+Makefile
+Makefile.Debug
+Makefile.Release
+
 # Visual Studio
 .vs/
 *.user
