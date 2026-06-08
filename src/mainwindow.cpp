@@ -1,9 +1,9 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 #include "constants.h"
+#include "config_manager.h"
 #include <QProcess>
 #include <QMessageBox>
-#include <QSettings>
 #include <QNetworkInterface>
 #include <QDateTime>
 #include <QTimer>
@@ -211,6 +211,9 @@ void MainWindow::initEapUdpProcesses()
     m_udpProcess->moveToThread(&m_udpThread);
     connect(&m_udpThread, &QThread::finished, m_udpProcess, &QObject::deleteLater);
     connect(m_udpProcess, &UdpProcess::stateChanged,  this, &MainWindow::onUdpStateChanged);
+    connect(m_udpProcess, &UdpProcess::online,        this, [this]() {
+        setAppState(AppConnectionState::Connected);
+    });
     connect(m_udpProcess, &UdpProcess::logMessage,    this, &MainWindow::onLogMessage);
     connect(m_udpProcess, &UdpProcess::heartbeatFailed, this, &MainWindow::onHeartbeatFailed);
     m_udpThread.start();
@@ -373,64 +376,56 @@ void MainWindow::autoDetectNetworkConfig()
 void MainWindow::loadConfig()
 {
     QString configPath = QCoreApplication::applicationDirPath() + "/config.ini";
-    QSettings settings(configPath, QSettings::IniFormat);
+    AppConfig cfg = ConfigManager::load(configPath);
 
-    ui->editUsername->setText(settings.value("username", "").toString());
-    QByteArray pwdBase64 = settings.value("password", "").toByteArray();
-    if (!pwdBase64.isEmpty()) {
-        ui->editPassword->setText(QString::fromUtf8(QByteArray::fromBase64(pwdBase64)));
+    ui->editUsername->setText(cfg.username);
+    if (cfg.savePassword) {
+        ui->editPassword->setText(cfg.password);
         ui->checkSavePassword->setChecked(true);
     }
-    ui->editHost->setText(settings.value("host", DEFAULT_HOST).toString());
-    ui->editDNSServer->setText(settings.value("dns", DEFAULT_DNS).toString());
+    ui->editHost->setText(cfg.host);
+    ui->editDNSServer->setText(cfg.dns);
 
-    editMac->setText(settings.value("manualMac", "").toString());
-    editIp->setText(settings.value("manualIp", "").toString());
-    editMask->setText(settings.value("manualMask", "255.255.255.0").toString());
-    editGateway->setText(settings.value("manualGateway", "").toString());
-    editBackupDNS->setText(settings.value("backupDns", "").toString());
+    editMac->setText(cfg.manualMac);
+    editIp->setText(cfg.manualIp);
+    editMask->setText(cfg.manualMask);
+    editGateway->setText(cfg.manualGateway);
+    editBackupDNS->setText(cfg.backupDns);
 
-    checkAutoSetNetwork->setChecked(settings.value("autoSetNetwork", false).toBool());
-    checkAutoStart->setChecked(settings.value("autoStart", false).toBool());
-    checkAutoConnect->setChecked(settings.value("autoConnect", false).toBool());
+    checkAutoSetNetwork->setChecked(cfg.autoSetNetwork);
+    checkAutoStart->setChecked(cfg.autoStart);
+    checkAutoConnect->setChecked(cfg.autoConnect);
 
-    QString savedInterface = settings.value("interface", "").toString();
     bool found = false;
     for (int i = 0; i < ui->comboInterface->count(); i++) {
-        if (ui->comboInterface->itemData(i).toString() == savedInterface) {
+        if (ui->comboInterface->itemData(i).toString() == cfg.interfaceName) {
             ui->comboInterface->setCurrentIndex(i);
             found = true;
             break;
         }
     }
-    if (!found && !savedInterface.isEmpty())
-        settings.remove("interface");
 }
 
 void MainWindow::saveConfig()
 {
+    AppConfig cfg;
+    cfg.username      = ui->editUsername->text();
+    cfg.password      = ui->editPassword->text();
+    cfg.host          = ui->editHost->text();
+    cfg.dns           = ui->editDNSServer->text();
+    cfg.backupDns     = editBackupDNS->text();
+    cfg.interfaceName = ui->comboInterface->currentData().toString();
+    cfg.manualMac     = editMac->text();
+    cfg.manualIp      = editIp->text();
+    cfg.manualMask    = editMask->text();
+    cfg.manualGateway = editGateway->text();
+    cfg.savePassword  = ui->checkSavePassword->isChecked();
+    cfg.autoSetNetwork = checkAutoSetNetwork->isChecked();
+    cfg.autoStart      = checkAutoStart->isChecked();
+    cfg.autoConnect    = checkAutoConnect->isChecked();
+
     QString configPath = QCoreApplication::applicationDirPath() + "/config.ini";
-    QSettings settings(configPath, QSettings::IniFormat);
-
-    settings.setValue("username",  ui->editUsername->text());
-    settings.setValue("host",      ui->editHost->text());
-    settings.setValue("dns",       ui->editDNSServer->text());
-    settings.setValue("interface", ui->comboInterface->currentData().toString());
-
-    settings.setValue("manualMac",      editMac->text());
-    settings.setValue("manualIp",       editIp->text());
-    settings.setValue("manualMask",     editMask->text());
-    settings.setValue("manualGateway",  editGateway->text());
-    settings.setValue("backupDns",      editBackupDNS->text());
-
-    settings.setValue("autoSetNetwork", checkAutoSetNetwork->isChecked());
-    settings.setValue("autoStart",      checkAutoStart->isChecked());
-    settings.setValue("autoConnect",    checkAutoConnect->isChecked());
-
-    if (ui->checkSavePassword->isChecked())
-        settings.setValue("password", ui->editPassword->text().toUtf8().toBase64());
-    else
-        settings.remove("password");
+    ConfigManager::save(configPath, cfg);
 
     setAutoStartRegistry(checkAutoStart->isChecked());
 }
@@ -469,14 +464,12 @@ void MainWindow::on_btnConnect_clicked()
         return;
     }
 
-    // 自动检测 MAC（如果用户未填写）
+    // MAC 未填写时尝试从当前网卡自动获取（仅填充 UI，最终组装由 getCurrentConfig() 完成）
     QString macStr = editMac->text().trimmed();
     if (macStr.isEmpty()) {
         QNetworkInterface iface;
         if (!info.guid.isEmpty())
             iface = QNetworkInterface::interfaceFromName(info.guid);
-        if (!iface.isValid())
-            iface = QNetworkInterface::interfaceFromName(pcapName);
         if (iface.isValid() && !iface.hardwareAddress().isEmpty()) {
             macStr = iface.hardwareAddress();
             editMac->setText(macStr);
@@ -690,10 +683,10 @@ void MainWindow::onEapStateChanged(AuthState state, const QString& message)
     }
 }
 
-void MainWindow::onUdpStateChanged(const QString& state, const QString& /*message*/)
+void MainWindow::onUdpStateChanged(const QString& /*state*/, const QString& /*message*/)
 {
-    if (state == "在线")
-        setAppState(AppConnectionState::Connected);
+    // 状态同步已由 UdpProcess::online() 信号处理
+    // 此槽位保留用于日志消息转发
 }
 
 void MainWindow::onEapSuccess(const QByteArray& md5Data)

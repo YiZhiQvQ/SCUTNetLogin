@@ -158,6 +158,15 @@ enum class AuthState {
     Stopped                     // 用户主动断开
 };
 
+// UDP 握手状态枚举（DrCOM UDP 心跳协议状态机）
+enum class UdpState {
+    Idle,                       // 空闲
+    WaitingAliveResponse,       // 已发 MiscAlive，等待 0x02 响应
+    WaitingInfoResponse,        // 已发 MiscInfo，等待 0x04 响应
+    Online,                     // 心跳维持中
+    Stopped                     // 用户主动断开
+};
+
 // 认证配置（跨 EapProcess / UdpProcess 共享）
 struct AuthConfig {
     QString  interfaceName;     // pcap 设备名 (如 \Device\NPF_{GUID})

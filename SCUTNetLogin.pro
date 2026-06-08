@@ -15,12 +15,14 @@ QMAKE_LFLAGS += /MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\"
 SOURCES += \
     src/main.cpp \
     src/mainwindow.cpp \
+    src/config_manager.cpp \
     src/eap_process.cpp \
     src/udp_process.cpp \
     src/network.cpp
 
 HEADERS += \
     src/mainwindow.h \
+    src/config_manager.h \
     src/eap_process.h \
     src/udp_process.h \
     src/protocol.h \

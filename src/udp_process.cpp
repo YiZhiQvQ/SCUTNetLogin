@@ -113,30 +113,38 @@ void UdpProcess::start() {
         connect(m_socket, &QUdpSocket::readyRead, this, &UdpProcess::onReadyRead, Qt::UniqueConnection);
     }
 
-    QHostInfo hostInfo = QHostInfo::fromName(m_config.host);
-    if (hostInfo.addresses().isEmpty()) {
-        log(LogLevel::Error, "无法解析服务器地址: " + m_config.host);
-        return;
-    }
-    QHostAddress serverAddr = hostInfo.addresses().first();
-
-    m_socket->connectToHost(serverAddr, DRCOM_UDP_PORT);
-    log(LogLevel::Info, QString("连接 UDP 服务器: %1:%2").arg(serverAddr.toString()).arg(DRCOM_UDP_PORT));
-
     m_running = true;
     m_counter = 0;
     m_flux.fill(0);
     m_rnd.fill(0);
     m_decryptedInfo.fill(0);
 
-    emit stateChanged("运行中", "开始UDP握手");
-    sendMiscAlive();
+    emit stateChanged("运行中", "正在解析服务器地址...");
+
+    m_udpState = UdpState::WaitingAliveResponse;
+
+    // 异步 DNS 查询，避免阻塞 UDP 工作线程
+    QHostInfo::lookupHost(m_config.host, this, [this](const QHostInfo& hostInfo) {
+        QMutexLocker locker(&m_mutex);
+        if (!m_running) return;
+
+        if (hostInfo.addresses().isEmpty()) {
+            log(LogLevel::Error, "无法解析服务器地址: " + m_config.host);
+            return;
+        }
+        QHostAddress serverAddr = hostInfo.addresses().first();
+
+        m_socket->connectToHost(serverAddr, DRCOM_UDP_PORT);
+        log(LogLevel::Info, QString("连接 UDP 服务器: %1:%2").arg(serverAddr.toString()).arg(DRCOM_UDP_PORT));
+        sendMiscAlive();
+    });
 }
 
 void UdpProcess::stop() {
     QMutexLocker locker(&m_mutex);
 
     m_running = false;
+    m_udpState = UdpState::Stopped;
     if (m_heartbeatTimer) {
         m_heartbeatTimer->stop();
         delete m_heartbeatTimer;
@@ -306,6 +314,7 @@ void UdpProcess::onReadyRead() {
         case DRCOM_SUBTYPE_MISC_RESPONSE_ALIVE: {
             if (data.size() >= static_cast<int>(sizeof(DrcomMiscResponseAlive)))
                 memcpy(m_flux.data(), data.constData() + 8, m_flux.size());
+            m_udpState = UdpState::WaitingInfoResponse;
             sendMiscInfo();
             break;
         }
@@ -317,7 +326,8 @@ void UdpProcess::onReadyRead() {
                     QByteArray(reinterpret_cast<const char*>(m_decryptedInfo.data()),
                                static_cast<int>(m_decryptedInfo.size())).toHex());
                 m_heartbeatTimer->start();
-                emit stateChanged("在线", "心跳稳定");
+                m_udpState = UdpState::Online;
+                emit online();
                 sendAlive();
             }
             break;

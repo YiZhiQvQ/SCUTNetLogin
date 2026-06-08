@@ -24,6 +24,7 @@ public slots:
 
 signals:
     void stateChanged(const QString& state, const QString& message);
+    void online();              // UDP 握手完成，进入在线心跳状态
     void logMessage(const QString& message, int level);
     void heartbeatFailed();
 
@@ -51,6 +52,7 @@ private:
     QTimer* m_heartbeatTimer = nullptr;
     QTimer* m_timeoutTimer = nullptr;
     std::atomic<bool> m_running{false};
+    UdpState m_udpState = UdpState::Idle;
     uint8_t m_counter = 0;
 };
 
