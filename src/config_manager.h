@@ -2,6 +2,7 @@
 #define CONFIG_MANAGER_H
 
 #include <QString>
+#include "protocol.h"
 
 // 配置持久化数据的纯数据结构 — 从 UI 控件解耦
 struct AppConfig {
@@ -23,11 +24,17 @@ struct AppConfig {
 
 namespace ConfigManager {
 
+// 配置文件默认路径（exe 同目录下的 config.ini）
+QString defaultPath();
+
 // 从 config.ini 读取配置，密码自动 Base64 解码
 AppConfig load(const QString& configPath);
 
 // 写入 config.ini，若 savePassword 为 true 则密码 Base64 编码
 void save(const QString& configPath, const AppConfig& cfg);
+
+// AppConfig → AuthConfig 转换（不含 hostname / serverIp 运行时字段）
+AuthConfig toAuthConfig(const AppConfig& cfg);
 
 } // namespace ConfigManager
 

@@ -1,8 +1,16 @@
 #include "config_manager.h"
 #include "constants.h"
+#include "network.h"
 #include <QSettings>
+#include <QCoreApplication>
+#include <QHostAddress>
 
 namespace ConfigManager {
+
+QString defaultPath()
+{
+    return QCoreApplication::applicationDirPath() + QStringLiteral("/config.ini");
+}
 
 AppConfig load(const QString& configPath)
 {
@@ -52,6 +60,31 @@ void save(const QString& configPath, const AppConfig& cfg)
         settings.setValue("password", cfg.password.toUtf8().toBase64());
     else
         settings.remove("password");
+}
+
+AuthConfig toAuthConfig(const AppConfig& cfg)
+{
+    AuthConfig config;
+    config.username      = cfg.username;
+    config.password      = cfg.password;
+    config.host          = cfg.host;
+    config.dnsServer     = cfg.dns;
+    config.interfaceName = cfg.interfaceName;
+
+    // MAC
+    QString macStr = Network::normalizeMac(cfg.manualMac);
+    if (!macStr.isEmpty()) {
+        QByteArray bytes = QByteArray::fromHex(macStr.toLatin1());
+        if (bytes.size() == 6)
+            memcpy(config.localMac, bytes.constData(), 6);
+    }
+
+    // IP
+    QHostAddress addr(cfg.manualIp);
+    if (addr.protocol() == QAbstractSocket::IPv4Protocol)
+        Network::ipv4ToBytes(addr, config.localIp);
+
+    return config;
 }
 
 } // namespace ConfigManager

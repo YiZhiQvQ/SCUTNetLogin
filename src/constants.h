@@ -116,6 +116,9 @@ constexpr int DRCOM_MISC_MAX_USERNAME_LEN     = 25;
 constexpr std::array<uint8_t, 4> DRCOM_MISC_UNKNOWN1  = { 0x02, 0x22, 0x00, 0x2a };
 constexpr std::array<uint8_t, 4> DRCOM_MISC_CKSPARAM  = { 0xc7, 0x2f, 0x31, 0x01 };  // cks32 初始种子
 constexpr std::array<uint8_t, 4> DRCOM_MISC_UNKNOWN2  = { 0x94, 0x00, 0x00, 0x00 };
+// 以下 OS 版本字段为 DrCOM 协议兼容的伪装值 (Windows 8 = 6.2.9200)。
+// 实际 OS 版本仅影响 MiscInfo 包内容，不影响认证流程；
+// 如需真实版本，可通过 RtlGetVersion 动态获取并填充。
 constexpr std::array<uint8_t, 4> DRCOM_MISC_OS_MAJOR  = { 0x06, 0x00, 0x00, 0x00 };
 constexpr std::array<uint8_t, 4> DRCOM_MISC_OS_MINOR  = { 0x02, 0x00, 0x00, 0x00 };
 constexpr std::array<uint8_t, 4> DRCOM_MISC_OS_BUILD  = { 0xf0, 0x23, 0x00, 0x00 };

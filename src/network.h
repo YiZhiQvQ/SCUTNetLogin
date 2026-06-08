@@ -5,6 +5,7 @@
 #include <QStringList>
 #include <QList>
 #include <QHostAddress>
+#include <QNetworkInterface>
 #include <cstdint>
 
 namespace Network {
@@ -21,6 +22,9 @@ struct InterfaceEntry {
     QString pcapName;     // Npcap 设备名，如 \Device\NPF_{GUID}
     bool isWireless = false;
 };
+
+// 将 pcap 设备名映射到 Windows QNetworkInterface（一次查询，遍历 GUID + 描述 + WMI）
+QNetworkInterface findInterface(const QString& pcapName, const QString& pcapDescription = QString());
 
 // 将 pcap 设备名映射到 Windows 适配器信息（一次查询返回 guid + displayName）
 AdapterInfo adapterInfo(const QString& pcapName, const QString& pcapDescription = QString());

@@ -15,11 +15,11 @@
 namespace Network {
 
 // ============================================================================
-// 内部辅助：将 pcap 设备名 / 描述映射到 Windows QNetworkInterface
+// findInterface — 将 pcap 设备名 / 描述映射到 Windows QNetworkInterface
 // ============================================================================
 
-static QNetworkInterface findWindowsInterface(const QString& pcapName,
-                                               const QString& pcapDescription)
+QNetworkInterface findInterface(const QString& pcapName,
+                                const QString& pcapDescription)
 {
     QRegularExpression re(R"(\\Device\\NPF_\{([A-Fa-f0-9\-]+)\})");
     auto match = re.match(pcapName);
@@ -65,7 +65,7 @@ static QNetworkInterface findWindowsInterface(const QString& pcapName,
 
 AdapterInfo adapterInfo(const QString& pcapName, const QString& pcapDescription)
 {
-    QNetworkInterface iface = findWindowsInterface(pcapName, pcapDescription);
+    QNetworkInterface iface = findInterface(pcapName, pcapDescription);
     if (iface.isValid())
         return { iface.name(), iface.humanReadableName() };
     return {};

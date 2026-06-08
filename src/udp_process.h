@@ -14,7 +14,7 @@ class UdpProcess : public QObject {
 
 public:
     explicit UdpProcess(QObject* parent = nullptr);
-    ~UdpProcess();
+    ~UdpProcess() override;
     void setConfig(const AuthConfig& config);
     void setMd5Data(const QByteArray& md5Data);
 

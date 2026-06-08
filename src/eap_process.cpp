@@ -1,6 +1,6 @@
 #include "eap_process.h"
 #include "constants.h"
-#include <QCryptographicHash>
+#include "eapol_packet.h"
 #include <QThread>
 #include <winsock2.h>
 
@@ -86,18 +86,7 @@ QByteArray EapProcess::receivePacket()
 
 std::vector<uint8_t> EapProcess::buildEapolFrame(uint8_t eapolType, uint16_t eapolBodyLen) const
 {
-    std::vector<uint8_t> frame(EAPOL_FRAME_BUFFER_SIZE, 0);
-    EthHeader*   eth   = reinterpret_cast<EthHeader*>(frame.data());
-    EAPOLHeader* eapol = reinterpret_cast<EAPOLHeader*>(frame.data() + ETH_HEADER_SIZE);
-
-    memcpy(eth->src_mac, m_config.localMac, 6);
-    eth->eth_type = htons(ETHERTYPE_EAPOL);
-
-    eapol->version     = EAPOL_VERSION;
-    eapol->packet_type = eapolType;
-    eapol->length      = htons(eapolBodyLen);
-
-    return frame;
+    return EapolPacket::buildEapolFrame(m_config.localMac, eapolType, eapolBodyLen);
 }
 
 // ============================================================================
@@ -128,17 +117,8 @@ void EapProcess::sendEapResponse(uint8_t eapType, uint8_t requestId,
 {
     m_currentIdentifier = requestId;
 
-    uint16_t bodyLen = static_cast<uint16_t>(5 + payload.size());
-    auto frame = buildEapolFrame(EAPOL_TYPE_EAP_PACKET, bodyLen);
-    memcpy(reinterpret_cast<EthHeader*>(frame.data())->dest_mac, m_switchMac, 6);
-
-    EAPHeader* eap = reinterpret_cast<EAPHeader*>(frame.data() + EAP_HEADER_OFFSET);
-    eap->code   = EAP_CODE_RESPONSE;
-    eap->id     = requestId;
-    eap->length = htons(bodyLen);
-    eap->type   = eapType;
-
-    memcpy(frame.data() + EAP_PAYLOAD_OFFSET, payload.data(), payload.size());
+    auto frame = EapolPacket::buildEapResponseFrame(m_config.localMac, m_switchMac,
+                                                     eapType, requestId, payload);
 
     lastPacket = QByteArray(reinterpret_cast<const char*>(frame.data()),
                              static_cast<int>(frame.size()));
@@ -152,12 +132,7 @@ void EapProcess::sendEapResponse(uint8_t eapType, uint8_t requestId,
 QByteArray EapProcess::calculateMD5(uint8_t identifier, const QString& password,
                                      const QByteArray& challenge)
 {
-    QByteArray data;
-    data.append(static_cast<char>(identifier));
-    QByteArray pwdUtf8 = password.toUtf8();
-    data.append(pwdUtf8);
-    data.append(challenge);
-    return QCryptographicHash::hash(data, QCryptographicHash::Md5);
+    return EapolPacket::calculateMD5(identifier, password, challenge);
 }
 
 // ============================================================================
@@ -195,37 +170,68 @@ bool EapProcess::parsePacket(const QByteArray& data, EAPHeader* outEapHeader,
 }
 
 // ============================================================================
-// 服务器通知解析
+// 服务器通知解析 — 数据驱动查表，消除 if-else 链
 // ============================================================================
 
 void EapProcess::parseNotification(const QString& msg)
 {
-    log(LogLevel::Error, "服务器通知: " + msg);
+    log(LogLevel::Error, QStringLiteral("服务器通知: ") + msg);
 
-    if (msg.startsWith("userid error")) {
-        QString code = msg.mid(13).trimmed();
-        if (code == "1")      log(LogLevel::Error, "账号不存在");
-        else if (code == "2" || code == "3") log(LogLevel::Error, "用户名或密码错误");
-        else if (code == "4") log(LogLevel::Error, "该账号可能已过期");
-    } else if (msg.startsWith("Authentication Fail ErrCode=")) {
-        QString code = msg.mid(28).trimmed();
-        if (code == "0")      log(LogLevel::Error, "用户名或密码错误");
-        else if (code == "5") log(LogLevel::Error, "该账号已被停用");
-        else if (code == "9") log(LogLevel::Error, "该账号可能已过期");
-        else if (code == "11") log(LogLevel::Error, "不允许进行RADIUS认证");
-        else if (code == "16") {
-            log(LogLevel::Error, "当前时段禁止上网，程序将休眠等待");
-            emit sleepRequired();
-        } else if (code == "30" || code == "63")
-            log(LogLevel::Error, "该账号流量/时长已用尽");
-    } else if (msg.startsWith("AdminReset")) {
-        log(LogLevel::Error, "管理员已重置连接");
-    } else if (msg.startsWith("Mac, IP, NASip, PORT")) {
-        log(LogLevel::Error, "当前IP/MAC地址不允许登录");
-    } else if (msg.startsWith("flowover")) {
-        log(LogLevel::Error, "流量已用尽");
-    } else if (msg.startsWith("In use")) {
-        log(LogLevel::Error, "该账号正在使用中（多设备在线）");
+    // --- Code-based 错误: "prefix + code" 格式 ---
+    struct CodePattern {
+        QStringView prefix;
+        int         codeOffset;  // code 子串起始位置（从 prefix 尾部算起）
+    };
+    static constexpr CodePattern kCodePatterns[] = {
+        { QStringLiteral("userid error"),                 13 },
+        { QStringLiteral("Authentication Fail ErrCode="), 28 },
+    };
+
+    // "code → 中文描述" 查找表（两个 pattern 共享），sleepReq 标记需休眠等待
+    struct CodeMessage { QStringView code; const char* msg; bool sleepReq = false; };
+    static constexpr CodeMessage kCodeMessages[] = {
+        { QStringLiteral("0"),  "用户名或密码错误" },
+        { QStringLiteral("1"),  "账号不存在" },
+        { QStringLiteral("2"),  "用户名或密码错误" },
+        { QStringLiteral("3"),  "用户名或密码错误" },
+        { QStringLiteral("4"),  "该账号可能已过期" },
+        { QStringLiteral("5"),  "该账号已被停用" },
+        { QStringLiteral("9"),  "该账号可能已过期" },
+        { QStringLiteral("11"), "不允许进行RADIUS认证" },
+        { QStringLiteral("16"), "当前时段禁止上网，程序将休眠等待", true },
+        { QStringLiteral("30"), "该账号流量/时长已用尽" },
+        { QStringLiteral("63"), "该账号流量/时长已用尽" },
+    };
+
+    for (const auto& pattern : kCodePatterns) {
+        if (!msg.startsWith(pattern.prefix))
+            continue;
+
+        QStringView code = QStringView(msg).mid(pattern.codeOffset).trimmed();
+        for (const auto& cm : kCodeMessages) {
+            if (code == cm.code) {
+                log(LogLevel::Error, cm.msg);
+                if (cm.sleepReq)
+                    emit sleepRequired();
+                return;
+            }
+        }
+        return;  // prefix 匹配但 code 未知 — 不再尝试其他 pattern
+    }
+
+    // --- 简单前缀匹配错误（无 code） ---
+    static constexpr struct { QStringView prefix; const char* msg; } kSimpleErrors[] = {
+        { QStringLiteral("AdminReset"),           "管理员已重置连接" },
+        { QStringLiteral("Mac, IP, NASip, PORT"), "当前IP/MAC地址不允许登录" },
+        { QStringLiteral("flowover"),             "流量已用尽" },
+        { QStringLiteral("In use"),               "该账号正在使用中（多设备在线）" },
+    };
+
+    for (const auto& entry : kSimpleErrors) {
+        if (msg.startsWith(entry.prefix)) {
+            log(LogLevel::Error, entry.msg);
+            return;
+        }
     }
 }
 
@@ -314,8 +320,106 @@ void EapProcess::stop()
 }
 
 // ============================================================================
-// 定时器槽
+// 定时器槽 — 拆分为 drainPackets / processEapPacket / handleEapRequest / checkRetransmit
 // ============================================================================
+
+QVector<QByteArray> EapProcess::drainPackets()
+{
+    QVector<QByteArray> packets;
+    while (true) {
+        QByteArray packet = receivePacket();
+        if (packet.isEmpty())
+            break;
+        packets.append(std::move(packet));
+    }
+    return packets;
+}
+
+// 返回 false 表示致命错误，调用者须 unlock 后调用 stop()
+bool EapProcess::processEapPacket(const QByteArray& packet)
+{
+    const EthHeader* eth = reinterpret_cast<const EthHeader*>(packet.data());
+
+    // 早期握手中嗅探交换机 MAC（用于后续单播）
+    if (m_currentState == AuthState::Idle || m_currentState == AuthState::SendingStart) {
+        if (!isMulticastMac(eth->src_mac))
+            memcpy(m_switchMac, eth->src_mac, 6);
+    }
+
+    EAPHeader eapHeader;
+    QByteArray payload;
+    if (!parsePacket(packet, &eapHeader, &payload))
+        return true;  // 非 EAP 包，跳过
+
+    m_retransmitTimer.restart();
+
+    if (eapHeader.code == EAP_CODE_REQUEST) {
+        handleEapRequest(eapHeader, payload);
+    } else if (eapHeader.code == EAP_CODE_SUCCESS) {
+        if (m_currentState != AuthState::Authenticated) {
+            log(LogLevel::Info, QStringLiteral("802.1X 认证成功！保持后台监听心跳..."));
+            m_currentState = AuthState::Authenticated;
+            emit stateChanged(AuthState::Authenticated, QStringLiteral("认证成功"));
+            emit eapSuccess(m_md5Result);
+        }
+    } else if (eapHeader.code == EAP_CODE_FAILURE) {
+        log(LogLevel::Error, QStringLiteral("认证被拒绝 (可能是冷却期，稍等1分钟再试)"));
+        m_currentState = AuthState::Failed;
+        emit stateChanged(AuthState::Failed, QStringLiteral("认证失败"));
+        return false;  // 致命错误，调用者负责 stop()
+    }
+
+    return true;
+}
+
+void EapProcess::handleEapRequest(const EAPHeader& hdr, const QByteArray& payload)
+{
+    QByteArray userUtf8 = m_config.username.toUtf8();
+
+    switch (hdr.type) {
+    case EAP_TYPE_IDENTITY: {
+        if (m_currentState != AuthState::Authenticated) {
+            log(LogLevel::Info, QStringLiteral("收到 Identity 请求，正在回应..."));
+            m_currentState = AuthState::SendingIdentity;
+        }
+        // 已认证状态下也静默回应（心跳检测），不写日志避免刷屏
+        QByteArray idPayload = EapolPacket::buildIdentityPayload(userUtf8, m_config.localIp);
+        sendEapResponse(EAP_TYPE_IDENTITY, hdr.id, idPayload, m_lastIdentityPacket);
+        break;
+    }
+    case EAP_TYPE_MD5_CHALLENGE: {
+        if (m_currentState != AuthState::Authenticated) {
+            log(LogLevel::Info, QStringLiteral("收到 MD5 挑战，计算回应..."));
+            m_currentState = AuthState::SendingMD5Challenge;
+        }
+        if (payload.size() > 1) {
+            uint8_t md5Size = static_cast<uint8_t>(payload[0]);
+            QByteArray challenge = payload.mid(1, md5Size);
+            m_md5Result = calculateMD5(hdr.id, m_config.password, challenge);
+
+            QByteArray md5Payload = EapolPacket::buildMd5ChallengePayload(
+                m_md5Result, userUtf8, m_config.localIp);
+            sendEapResponse(EAP_TYPE_MD5_CHALLENGE, hdr.id, md5Payload, m_lastMd5Packet);
+        }
+        break;
+    }
+    case EAP_TYPE_NOTIFICATION:
+        parseNotification(QString::fromUtf8(payload));
+        break;
+    }
+}
+
+void EapProcess::checkRetransmit()
+{
+    if (m_currentState == AuthState::Authenticated || m_currentState == AuthState::Idle)
+        return;
+
+    if (m_retransmitTimer.hasExpired(EAP_RETRANSMIT_INTERVAL)) {
+        log(LogLevel::Warning, QStringLiteral("等待交换机响应中..."));
+        onTimeout();
+        m_retransmitTimer.restart();
+    }
+}
 
 void EapProcess::onPollTimeout()
 {
@@ -324,96 +428,15 @@ void EapProcess::onPollTimeout()
 
     QMutexLocker locker(&m_mutex);
 
-    // 一次性读空 pcap 缓冲区所有积压包
-    while (true) {
-        QByteArray packet = receivePacket();
-        if (packet.isEmpty())
-            break;
-
-        const EthHeader* eth = reinterpret_cast<const EthHeader*>(packet.data());
-        if (m_currentState == AuthState::Idle || m_currentState == AuthState::SendingStart) {
-            if (!isMulticastMac(eth->src_mac))
-                memcpy(m_switchMac, eth->src_mac, 6);
-        }
-
-        EAPHeader eapHeader;
-        QByteArray payload;
-        if (!parsePacket(packet, &eapHeader, &payload))
-            continue;
-
-        m_retransmitTimer.restart();
-
-        if (eapHeader.code == EAP_CODE_REQUEST) {
-            QByteArray userUtf8 = m_config.username.toUtf8();
-
-            switch (eapHeader.type) {
-            case EAP_TYPE_IDENTITY: {
-                if (m_currentState == AuthState::Authenticated) {
-                    // 心跳检测：静默回应，不写日志避免刷屏
-                } else {
-                    log(LogLevel::Info, "收到 Identity 请求，正在回应...");
-                    m_currentState = AuthState::SendingIdentity;
-                }
-
-                QByteArray idPayload;
-                idPayload.append(userUtf8);
-                idPayload.append(reinterpret_cast<const char*>(DRCOM_IDENTITY_RESPONSE_SUFFIX.data()),
-                                 DRCOM_IDENTITY_RESPONSE_SUFFIX.size());
-                idPayload.append(reinterpret_cast<const char*>(m_config.localIp), 4);
-                sendEapResponse(EAP_TYPE_IDENTITY, eapHeader.id, idPayload, m_lastIdentityPacket);
-                break;
-            }
-
-            case EAP_TYPE_MD5_CHALLENGE: {
-                if (m_currentState != AuthState::Authenticated) {
-                    log(LogLevel::Info, "收到 MD5 挑战，计算回应...");
-                    m_currentState = AuthState::SendingMD5Challenge;
-                }
-                if (payload.size() > 1) {
-                    uint8_t md5Size = static_cast<uint8_t>(payload[0]);
-                    QByteArray challenge = payload.mid(1, md5Size);
-                    m_md5Result = calculateMD5(eapHeader.id, m_config.password, challenge);
-
-                    QByteArray md5Payload;
-                    md5Payload.append(static_cast<char>(m_md5Result.size()));
-                    md5Payload.append(m_md5Result);
-                    md5Payload.append(userUtf8);
-                    md5Payload.append(reinterpret_cast<const char*>(DRCOM_MD5_RESPONSE_SUFFIX.data()),
-                                      DRCOM_MD5_RESPONSE_SUFFIX.size());
-                    md5Payload.append(reinterpret_cast<const char*>(m_config.localIp), 4);
-                    sendEapResponse(EAP_TYPE_MD5_CHALLENGE, eapHeader.id,
-                                    md5Payload, m_lastMd5Packet);
-                }
-                break;
-            }
-
-            case EAP_TYPE_NOTIFICATION:
-                parseNotification(QString::fromUtf8(payload));
-                break;
-            }
-        } else if (eapHeader.code == EAP_CODE_SUCCESS) {
-            if (m_currentState != AuthState::Authenticated) {
-                log(LogLevel::Info, "802.1X 认证成功！保持后台监听心跳...");
-                m_currentState = AuthState::Authenticated;
-                emit stateChanged(AuthState::Authenticated, "认证成功");
-                emit eapSuccess(m_md5Result);
-            }
-        } else if (eapHeader.code == EAP_CODE_FAILURE) {
-            log(LogLevel::Error, "认证被拒绝 (可能是冷却期，稍等1分钟再试)");
-            m_currentState = AuthState::Failed;
-            emit stateChanged(AuthState::Failed, "认证失败");
+    const auto packets = drainPackets();
+    for (const auto& pkt : packets) {
+        if (!processEapPacket(pkt)) {
+            // 致命错误 (EAP_FAILURE) — 必须先解锁再 stop（stop 内部会加锁）
             locker.unlock();
             stop();
             return;
         }
     }
 
-    // 握手阶段超时重发
-    if (m_currentState != AuthState::Authenticated && m_currentState != AuthState::Idle) {
-        if (m_retransmitTimer.hasExpired(EAP_RETRANSMIT_INTERVAL)) {
-            log(LogLevel::Warning, "等待交换机响应中...");
-            onTimeout();
-            m_retransmitTimer.restart();
-        }
-    }
+    checkRetransmit();
 }

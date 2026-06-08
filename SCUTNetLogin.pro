@@ -15,19 +15,27 @@ QMAKE_LFLAGS += /MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\"
 SOURCES += \
     src/main.cpp \
     src/mainwindow.cpp \
+    src/session_manager.cpp \
     src/config_manager.cpp \
+    src/network_worker.cpp \
     src/eap_process.cpp \
     src/udp_process.cpp \
-    src/network.cpp
+    src/network.cpp \
+    src/drcom_packet.cpp \
+    src/eapol_packet.cpp
 
 HEADERS += \
     src/mainwindow.h \
+    src/session_manager.h \
     src/config_manager.h \
+    src/network_worker.h \
     src/eap_process.h \
     src/udp_process.h \
     src/protocol.h \
     src/network.h \
-    src/constants.h
+    src/constants.h \
+    src/drcom_packet.h \
+    src/eapol_packet.h
 
 FORMS += src/mainwindow.ui
 

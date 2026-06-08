@@ -14,7 +14,7 @@ class EapProcess : public QObject {
 
 public:
     explicit EapProcess(QObject* parent = nullptr);
-    ~EapProcess();
+    ~EapProcess() override;
 
     void setConfig(AuthConfig config);
 
@@ -58,6 +58,12 @@ private:
     void log(LogLevel level, const QString& msg);
 
     static bool isMulticastMac(const uint8_t* mac);
+
+    // onPollTimeout 子步骤（调用者须持有 m_mutex）
+    QVector<QByteArray> drainPackets();
+    bool processEapPacket(const QByteArray& packet);   // false = 致命错误，需 stop
+    void handleEapRequest(const EAPHeader& hdr, const QByteArray& payload);
+    void checkRetransmit();
 
     AuthConfig m_config;
 

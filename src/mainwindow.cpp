@@ -2,7 +2,7 @@
 #include "ui_mainwindow.h"
 #include "constants.h"
 #include "config_manager.h"
-#include <QProcess>
+#include "network.h"
 #include <QMessageBox>
 #include <QNetworkInterface>
 #include <QDateTime>
@@ -11,81 +11,15 @@
 #include <QApplication>
 #include <QRegularExpression>
 #include <QIcon>
-#include <QDir>
 #include <QPainter>
 #include <QPixmap>
 #include <QTextCursor>
 #include <QClipboard>
 #include <QStyle>
-#include "network.h"
+#include <QDir>
+#include <QFile>
+#include <QTextStream>
 
-// ============================================================================
-// NetworkWorker 实现
-// ============================================================================
-
-NetworkWorker::NetworkWorker(QObject* parent)
-    : QObject(parent)
-{
-    moveToThread(&m_thread);
-    m_thread.start();
-}
-
-NetworkWorker::~NetworkWorker()
-{
-    stop();
-}
-
-void NetworkWorker::stop()
-{
-    m_thread.quit();
-    m_thread.wait(BG_TASK_WAIT_TIMEOUT);
-}
-
-void NetworkWorker::doSetStaticIp(const QString& adapter, const QString& ip,
-                                   const QString& mask, const QString& gw,
-                                   const QString& dns1, const QString& dns2)
-{
-    QString error;
-    bool ok = Network::setStaticIp(adapter, ip, mask, gw, dns1, dns2, &error);
-    QThread::msleep(IP_SETTLE_WAIT);
-    if (ok)
-        emit staticIpDone();
-    else
-        emit staticIpFailed(error);
-}
-
-void NetworkWorker::doSetDhcp(const QString& adapter)
-{
-    Network::setDhcp(adapter);
-}
-
-void NetworkWorker::doSetAutoStart(bool enable)
-{
-    QString taskName = "SCUTNetLogin_AutoStart";
-    QString appPath = QDir::toNativeSeparators(QCoreApplication::applicationFilePath());
-
-    QProcess proc;
-    proc.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* cpa) {
-        cpa->flags |= CREATE_NO_WINDOW;
-    });
-
-    if (enable) {
-        proc.start("schtasks", {
-            "/create", "/tn", taskName,
-            "/tr", "\"" + appPath + "\" --silent",
-            "/sc", "onlogon", "/rl", "highest", "/f"
-        });
-    } else {
-        proc.start("schtasks", {"/delete", "/tn", taskName, "/f"});
-    }
-    proc.waitForFinished(15000);
-
-    if (proc.exitCode() != 0) {
-        QString err = QString::fromLocal8Bit(proc.readAllStandardError());
-        if (!err.isEmpty())
-            qWarning() << "schtasks error:" << err;
-    }
-}
 
 // ============================================================================
 // 后备图标
@@ -98,7 +32,7 @@ static QIcon createFallbackIcon()
     QPainter p(&pm);
     p.setRenderHint(QPainter::Antialiasing);
     p.setPen(Qt::NoPen);
-    p.setBrush(QColor("#1a73e8"));
+    p.setBrush(QColor(QStringLiteral("#1a73e8")));
     p.drawRoundedRect(8, 8, 240, 240, 48, 48);
     QPen pen(Qt::white, 14, Qt::SolidLine, Qt::RoundCap);
     p.setPen(pen);
@@ -121,17 +55,7 @@ MainWindow::MainWindow(QWidget* parent)
 {
     ui->setupUi(this);
 
-    // 绑定 .ui 中已有的控件到成员指针（不再动态创建）
-    editMac            = ui->editMac;
-    editIp             = ui->editIp;
-    editMask           = ui->editMask;
-    editGateway        = ui->editGateway;
-    editBackupDNS      = ui->editBackupDNS;
-    checkAutoSetNetwork = ui->checkAutoSetNetwork;
-    checkAutoStart     = ui->checkAutoStart;
-    checkAutoConnect   = ui->checkAutoConnect;
-
-    QIcon appIcon(":/SCUTnetwork.ico");
+    QIcon appIcon(QStringLiteral(":/SCUTnetwork.ico"));
     if (appIcon.isNull())
         appIcon = createFallbackIcon();
     setWindowIcon(appIcon);
@@ -139,8 +63,7 @@ MainWindow::MainWindow(QWidget* parent)
     ui->comboInterface->installEventFilter(this);
     ui->comboInterface->setMinimumContentsLength(10);
 
-    initEapUdpProcesses();
-    initNetworkWorker();
+    initSessionManager();
     loadInterfaces();
     loadConfig();
     autoDetectNetworkConfig();
@@ -150,83 +73,38 @@ MainWindow::MainWindow(QWidget* parent)
 
     connect(ui->btnCopyLog, &QPushButton::clicked, this, [this]() {
         QGuiApplication::clipboard()->setText(ui->textLog->toPlainText());
-        onLogMessage("日志已复制到剪贴板", 0);
+        onLogMessage(QStringLiteral("日志已复制到剪贴板"), 0);
     });
 
     connect(ui->btnClearLog, &QPushButton::clicked, this, [this]() {
         ui->textLog->clear();
     });
 
-    if (checkAutoConnect->isChecked()) {
+    if (ui->checkAutoConnect->isChecked()) {
         QTimer::singleShot(AUTO_CONNECT_DELAY, this, [this]() {
-            onLogMessage("自动连接已开启，正在连接...", 0);
+            onLogMessage(QStringLiteral("自动连接已开启，正在连接..."), 0);
             on_btnConnect_clicked();
         });
     }
 
-    setAppState(AppConnectionState::Disconnected);
+    applyStateUI(AppConnectionState::Disconnected);
 }
 
 MainWindow::~MainWindow()
 {
-    setAppState(AppConnectionState::Disconnected);
-
-    if (m_eapProcess)
-        m_eapProcess->stop();
-    if (m_udpProcess)
-        m_udpProcess->stop();
-    m_eapThread.quit();
-    m_eapThread.wait();
-    m_udpThread.quit();
-    m_udpThread.wait();
-
-    if (m_networkWorker) {
-        m_networkWorker->stop();
-        m_networkWorker->deleteLater();
-        m_networkWorker = nullptr;
-    }
-
+    m_isQuitting = true;
     delete ui;
 }
 
 // ============================================================================
-// EAP / UDP / NetworkWorker 初始化
+// SessionManager 初始化
 // ============================================================================
 
-void MainWindow::initEapUdpProcesses()
+void MainWindow::initSessionManager()
 {
-    m_eapProcess = new EapProcess();
-    m_eapProcess->moveToThread(&m_eapThread);
-    connect(&m_eapThread, &QThread::finished, m_eapProcess, &QObject::deleteLater);
-    connect(m_eapProcess, &EapProcess::stateChanged,  this, &MainWindow::onEapStateChanged);
-    connect(m_eapProcess, &EapProcess::logMessage,   this, &MainWindow::onLogMessage);
-    connect(m_eapProcess, &EapProcess::eapSuccess,   this, &MainWindow::onEapSuccess);
-    connect(m_eapProcess, &EapProcess::sleepRequired, this, [this]() {
-        onLogMessage("当前时段禁止上网，已自动断开", 2);
-        on_btnDisconnect_clicked();
-    });
-    m_eapThread.start();
-
-    m_udpProcess = new UdpProcess();
-    m_udpProcess->moveToThread(&m_udpThread);
-    connect(&m_udpThread, &QThread::finished, m_udpProcess, &QObject::deleteLater);
-    connect(m_udpProcess, &UdpProcess::stateChanged,  this, &MainWindow::onUdpStateChanged);
-    connect(m_udpProcess, &UdpProcess::online,        this, [this]() {
-        setAppState(AppConnectionState::Connected);
-    });
-    connect(m_udpProcess, &UdpProcess::logMessage,    this, &MainWindow::onLogMessage);
-    connect(m_udpProcess, &UdpProcess::heartbeatFailed, this, &MainWindow::onHeartbeatFailed);
-    m_udpThread.start();
-}
-
-void MainWindow::initNetworkWorker()
-{
-    m_networkWorker = new NetworkWorker();
-    connect(m_networkWorker, &NetworkWorker::staticIpDone, this, &MainWindow::onStaticIpDone);
-    connect(m_networkWorker, &NetworkWorker::staticIpFailed, this, [this](const QString& error) {
-        onLogMessage("静态IP设置失败: " + error, 2);
-        setAppState(AppConnectionState::Disconnected);
-    });
+    m_sessionManager = new SessionManager(this);
+    connect(m_sessionManager, &SessionManager::stateChanged, this, &MainWindow::onStateChanged);
+    connect(m_sessionManager, &SessionManager::logMessage,   this, &MainWindow::onLogMessage);
 }
 
 // ============================================================================
@@ -235,9 +113,9 @@ void MainWindow::initNetworkWorker()
 
 void MainWindow::initSystemTray(const QIcon& icon)
 {
-    m_actionConnect    = new QAction("连接", this);
-    m_actionDisconnect = new QAction("断开", this);
-    m_actionQuit       = new QAction("退出", this);
+    m_actionConnect    = new QAction(QStringLiteral("连接"), this);
+    m_actionDisconnect = new QAction(QStringLiteral("断开"), this);
+    m_actionQuit       = new QAction(QStringLiteral("退出"), this);
     m_actionDisconnect->setEnabled(false);
 
     connect(m_actionConnect,    &QAction::triggered, this, &MainWindow::on_btnConnect_clicked);
@@ -252,7 +130,7 @@ void MainWindow::initSystemTray(const QIcon& icon)
 
     m_trayIcon = new QSystemTrayIcon(this);
     m_trayIcon->setContextMenu(m_trayMenu);
-    m_trayIcon->setToolTip("SCUT 校园网认证 (未连接)");
+    m_trayIcon->setToolTip(QStringLiteral("SCUT 校园网认证 (未连接)"));
     m_trayIcon->setIcon(icon);
 
     connect(m_trayIcon, &QSystemTrayIcon::activated, this, &MainWindow::onTrayIconActivated);
@@ -262,10 +140,11 @@ void MainWindow::initSystemTray(const QIcon& icon)
 void MainWindow::setSilentStartup()
 {
     hide();
-    if (checkAutoConnect->isChecked()) {
+    if (ui->checkAutoConnect->isChecked()) {
         QTimer::singleShot(SILENT_CONNECT_DELAY, this, [this]() { on_btnConnect_clicked(); });
     }
-    m_trayIcon->showMessage("SCUT 校园网认证", "程序已静默启动，点击托盘图标显示窗口",
+    m_trayIcon->showMessage(QStringLiteral("SCUT 校园网认证"),
+                            QStringLiteral("程序已静默启动，点击托盘图标显示窗口"),
                             QSystemTrayIcon::Information, 2000);
 }
 
@@ -273,7 +152,8 @@ void MainWindow::closeEvent(QCloseEvent* event)
 {
     if (m_trayIcon->isVisible() && !m_isQuitting) {
         hide();
-        m_trayIcon->showMessage("提示", "程序已最小化到托盘运行",
+        m_trayIcon->showMessage(QStringLiteral("提示"),
+                                QStringLiteral("程序已最小化到托盘运行"),
                                 QSystemTrayIcon::Information, 2000);
         event->ignore();
     }
@@ -282,7 +162,6 @@ void MainWindow::closeEvent(QCloseEvent* event)
 bool MainWindow::eventFilter(QObject* obj, QEvent* event)
 {
     if (event->type() == QEvent::Wheel && obj == ui->comboInterface) {
-        // 禁止滚轮切换网卡选项，将事件转发给滚动区域使页面正常上下滚动
         QCoreApplication::sendEvent(ui->scrollArea->viewport(), event);
         return true;
     }
@@ -301,8 +180,8 @@ void MainWindow::onTrayIconActivated(QSystemTrayIcon::ActivationReason reason)
 void MainWindow::onQuitApp()
 {
     m_isQuitting = true;
-    if (m_appState != AppConnectionState::Disconnected)
-        on_btnDisconnect_clicked();
+    if (m_sessionManager->state() != AppConnectionState::Disconnected)
+        m_sessionManager->stopConnection();
     m_trayIcon->hide();
     qApp->quit();
 }
@@ -327,46 +206,45 @@ void MainWindow::autoDetectNetworkConfig()
 {
     QString pcapName    = ui->comboInterface->currentData().toString();
     QString displayText = ui->comboInterface->currentText();
-    Network::AdapterInfo info = Network::adapterInfo(pcapName, displayText);
-
-    QNetworkInterface matched;
-    if (!info.guid.isEmpty())
-        matched = QNetworkInterface::interfaceFromName(info.guid);
-    if (!matched.isValid() && !info.displayName.isEmpty()) {
-        for (const QNetworkInterface& iface : QNetworkInterface::allInterfaces()) {
-            if (iface.humanReadableName().compare(info.displayName, Qt::CaseInsensitive) == 0) {
-                matched = iface;
-                break;
-            }
-        }
-    }
+    QNetworkInterface matched = Network::findInterface(pcapName, displayText);
     if (!matched.isValid())
         return;
 
     for (const QNetworkAddressEntry& entry : matched.addressEntries()) {
         if (entry.ip().protocol() != QAbstractSocket::IPv4Protocol || entry.ip().isLoopback())
             continue;
-        if (editIp->text().trimmed().isEmpty())
-            editIp->setText(entry.ip().toString());
-        if (editMask->text().trimmed().isEmpty() && !entry.netmask().isNull())
-            editMask->setText(entry.netmask().toString());
-        if (editGateway->text().trimmed().isEmpty()) {
+        if (ui->editIp->text().trimmed().isEmpty())
+            ui->editIp->setText(entry.ip().toString());
+        if (ui->editMask->text().trimmed().isEmpty() && !entry.netmask().isNull())
+            ui->editMask->setText(entry.netmask().toString());
+        if (ui->editGateway->text().trimmed().isEmpty()) {
             QHostAddress gwAddr(entry.ip().toIPv4Address()
                                 & entry.netmask().toIPv4Address() | 0x00000001);
-            editGateway->setText(gwAddr.toString());
+            ui->editGateway->setText(gwAddr.toString());
         }
         break;
     }
 
-    if (editMac->text().trimmed().isEmpty()) {
-        QNetworkInterface iface;
-        if (!info.guid.isEmpty())
-            iface = QNetworkInterface::interfaceFromName(info.guid);
-        if (!iface.isValid())
-            iface = matched;
-        if (iface.isValid() && !iface.hardwareAddress().isEmpty())
-            editMac->setText(iface.hardwareAddress());
+    if (ui->editMac->text().trimmed().isEmpty()
+        && !matched.hardwareAddress().isEmpty()) {
+        ui->editMac->setText(matched.hardwareAddress());
     }
+}
+
+QString MainWindow::autoDetectMacForUI()
+{
+    QString macStr = ui->editMac->text().trimmed();
+    if (!macStr.isEmpty())
+        return macStr;
+
+    QString pcapName    = ui->comboInterface->currentData().toString();
+    QString displayText = ui->comboInterface->currentText();
+    QNetworkInterface iface = Network::findInterface(pcapName, displayText);
+    if (iface.isValid() && !iface.hardwareAddress().isEmpty()) {
+        macStr = iface.hardwareAddress();
+        ui->editMac->setText(macStr);
+    }
+    return macStr;
 }
 
 // ============================================================================
@@ -375,8 +253,7 @@ void MainWindow::autoDetectNetworkConfig()
 
 void MainWindow::loadConfig()
 {
-    QString configPath = QCoreApplication::applicationDirPath() + "/config.ini";
-    AppConfig cfg = ConfigManager::load(configPath);
+    AppConfig cfg = ConfigManager::load(ConfigManager::defaultPath());
 
     ui->editUsername->setText(cfg.username);
     if (cfg.savePassword) {
@@ -386,21 +263,19 @@ void MainWindow::loadConfig()
     ui->editHost->setText(cfg.host);
     ui->editDNSServer->setText(cfg.dns);
 
-    editMac->setText(cfg.manualMac);
-    editIp->setText(cfg.manualIp);
-    editMask->setText(cfg.manualMask);
-    editGateway->setText(cfg.manualGateway);
-    editBackupDNS->setText(cfg.backupDns);
+    ui->editMac->setText(cfg.manualMac);
+    ui->editIp->setText(cfg.manualIp);
+    ui->editMask->setText(cfg.manualMask);
+    ui->editGateway->setText(cfg.manualGateway);
+    ui->editBackupDNS->setText(cfg.backupDns);
 
-    checkAutoSetNetwork->setChecked(cfg.autoSetNetwork);
-    checkAutoStart->setChecked(cfg.autoStart);
-    checkAutoConnect->setChecked(cfg.autoConnect);
+    ui->checkAutoSetNetwork->setChecked(cfg.autoSetNetwork);
+    ui->checkAutoStart->setChecked(cfg.autoStart);
+    ui->checkAutoConnect->setChecked(cfg.autoConnect);
 
-    bool found = false;
     for (int i = 0; i < ui->comboInterface->count(); i++) {
         if (ui->comboInterface->itemData(i).toString() == cfg.interfaceName) {
             ui->comboInterface->setCurrentIndex(i);
-            found = true;
             break;
         }
     }
@@ -413,310 +288,203 @@ void MainWindow::saveConfig()
     cfg.password      = ui->editPassword->text();
     cfg.host          = ui->editHost->text();
     cfg.dns           = ui->editDNSServer->text();
-    cfg.backupDns     = editBackupDNS->text();
+    cfg.backupDns     = ui->editBackupDNS->text();
     cfg.interfaceName = ui->comboInterface->currentData().toString();
-    cfg.manualMac     = editMac->text();
-    cfg.manualIp      = editIp->text();
-    cfg.manualMask    = editMask->text();
-    cfg.manualGateway = editGateway->text();
+    cfg.manualMac     = ui->editMac->text();
+    cfg.manualIp      = ui->editIp->text();
+    cfg.manualMask    = ui->editMask->text();
+    cfg.manualGateway = ui->editGateway->text();
     cfg.savePassword  = ui->checkSavePassword->isChecked();
-    cfg.autoSetNetwork = checkAutoSetNetwork->isChecked();
-    cfg.autoStart      = checkAutoStart->isChecked();
-    cfg.autoConnect    = checkAutoConnect->isChecked();
+    cfg.autoSetNetwork = ui->checkAutoSetNetwork->isChecked();
+    cfg.autoStart      = ui->checkAutoStart->isChecked();
+    cfg.autoConnect    = ui->checkAutoConnect->isChecked();
 
-    QString configPath = QCoreApplication::applicationDirPath() + "/config.ini";
-    ConfigManager::save(configPath, cfg);
+    ConfigManager::save(ConfigManager::defaultPath(), cfg);
 
-    setAutoStartRegistry(checkAutoStart->isChecked());
+    setAutoStartRegistry(ui->checkAutoStart->isChecked());
 }
-
-// ============================================================================
-// 开机自启
-// ============================================================================
 
 void MainWindow::setAutoStartRegistry(bool enable)
 {
-    QMetaObject::invokeMethod(m_networkWorker, "doSetAutoStart", Qt::QueuedConnection,
-                              Q_ARG(bool, enable));
+    m_sessionManager->setAutoStart(enable);
 }
 
 // ============================================================================
-// 连接 / 断开 主逻辑
+// 连接 / 断开
 // ============================================================================
 
 void MainWindow::on_btnConnect_clicked()
 {
-    if (m_appState != AppConnectionState::Disconnected)
+    if (m_sessionManager->state() != AppConnectionState::Disconnected)
         return;
     if (ui->comboInterface->count() == 0) {
-        onLogMessage("未检测到可用网卡，请点击刷新重试", 2);
+        onLogMessage(QStringLiteral("未检测到可用网卡，请点击刷新重试"), 2);
         return;
     }
 
     QString pcapName    = ui->comboInterface->currentData().toString();
     QString displayText = ui->comboInterface->currentText();
-    Network::AdapterInfo info = Network::adapterInfo(pcapName, displayText);
 
-    if ((!info.displayName.isEmpty() && info.displayName.contains("Loopback", Qt::CaseInsensitive))
-        || displayText.contains("Loopback", Qt::CaseInsensitive)
-        || pcapName.contains("Loopback", Qt::CaseInsensitive)) {
-        onLogMessage("错误：当前选中的是虚拟回环网卡，无法用于认证！", 2);
+    if (displayText.contains(QStringLiteral("Loopback"), Qt::CaseInsensitive)
+        || pcapName.contains(QStringLiteral("Loopback"), Qt::CaseInsensitive)) {
+        onLogMessage(QStringLiteral("错误：当前选中的是虚拟回环网卡，无法用于认证！"), 2);
         return;
     }
 
-    // MAC 未填写时尝试从当前网卡自动获取（仅填充 UI，最终组装由 getCurrentConfig() 完成）
-    QString macStr = editMac->text().trimmed();
-    if (macStr.isEmpty()) {
-        QNetworkInterface iface;
-        if (!info.guid.isEmpty())
-            iface = QNetworkInterface::interfaceFromName(info.guid);
-        if (iface.isValid() && !iface.hardwareAddress().isEmpty()) {
-            macStr = iface.hardwareAddress();
-            editMac->setText(macStr);
-        }
-    }
-
+    QString macStr = autoDetectMacForUI();
     saveConfig();
     ui->textLog->clear();
 
-    if (checkAutoSetNetwork->isChecked()) {
+    AuthConfig config = getCurrentConfig();
+
+    if (ui->checkAutoSetNetwork->isChecked()) {
         if (macStr.isEmpty()) {
-            onLogMessage("无法获取网卡MAC地址，静态IP配置失败。请手动填写MAC地址或取消静态IP配置。", 2);
+            onLogMessage(QStringLiteral("无法获取网卡MAC地址，静态IP配置失败。请手动填写MAC地址或取消静态IP配置。"), 2);
             return;
         }
 
         QString adapterForNetsh = Network::adapterNameByMac(macStr);
         if (adapterForNetsh.isEmpty()) {
-            onLogMessage(QString("未找到MAC地址 %1 对应的网络适配器，无法配置静态IP。").arg(macStr), 2);
+            onLogMessage(QStringLiteral("未找到MAC地址 %1 对应的网络适配器，无法配置静态IP。").arg(macStr), 2);
             return;
         }
 
-        QString ip   = editIp->text().trimmed();
-        QString mask = editMask->text().trimmed();
-        QString gw   = editGateway->text().trimmed();
+        QString ip   = ui->editIp->text().trimmed();
+        QString mask = ui->editMask->text().trimmed();
+        QString gw   = ui->editGateway->text().trimmed();
         QString dns1 = ui->editDNSServer->text().trimmed();
-        QString dns2 = editBackupDNS->text().trimmed();
+        QString dns2 = ui->editBackupDNS->text().trimmed();
 
         QStringList missing;
-        if (ip.isEmpty())   missing << "IPv4地址";
-        if (mask.isEmpty()) missing << "子网掩码";
-        if (gw.isEmpty())   missing << "默认网关";
-        if (dns1.isEmpty()) missing << "主DNS";
+        if (ip.isEmpty())   missing << QStringLiteral("IPv4地址");
+        if (mask.isEmpty()) missing << QStringLiteral("子网掩码");
+        if (gw.isEmpty())   missing << QStringLiteral("默认网关");
+        if (dns1.isEmpty()) missing << QStringLiteral("主DNS");
 
         if (!missing.isEmpty()) {
-            onLogMessage(QString("静态IP配置不完整，缺少: %1。请完善配置后重试。")
-                         .arg(missing.join(", ")), 2);
+            onLogMessage(QStringLiteral("静态IP配置不完整，缺少: %1。请完善配置后重试。")
+                         .arg(missing.join(QStringLiteral(", "))), 2);
             return;
         }
 
-        setAppState(AppConnectionState::SettingNetwork);
-        m_wasStaticIpSet = true;
+        StaticIpConfig ipCfg;
+        ipCfg.adapterName = adapterForNetsh;
+        ipCfg.ip    = ip;
+        ipCfg.mask  = mask;
+        ipCfg.gateway = gw;
+        ipCfg.dns1  = dns1;
+        ipCfg.dns2  = dns2;
+        ipCfg.mac   = macStr;
+
         ui->btnDisconnect->setEnabled(false);
         m_actionDisconnect->setEnabled(false);
-
-        onLogMessage(QString("正在设置静态IP: %1 / %2 / %3 ...").arg(ip, mask, gw), 0);
-
-        // 安全超时：如果仍卡在 SettingNetwork 状态，强制恢复
-        QTimer::singleShot(IP_SETUP_TIMEOUT, this, [this]() {
-            if (m_appState == AppConnectionState::SettingNetwork) {
-                onLogMessage("静态IP设置超时，请检查适配器名和网络配置", 2);
-                setAppState(AppConnectionState::Disconnected);
-            }
-        });
-
-        QMetaObject::invokeMethod(m_networkWorker, "doSetStaticIp", Qt::QueuedConnection,
-                                  Q_ARG(QString, adapterForNetsh), Q_ARG(QString, ip),
-                                  Q_ARG(QString, mask), Q_ARG(QString, gw),
-                                  Q_ARG(QString, dns1), Q_ARG(QString, dns2));
+        m_sessionManager->startConnection(config, ipCfg);
     } else {
-        startAuthentication();
+        m_sessionManager->startConnection(config);
     }
-}
-
-void MainWindow::onStaticIpDone()
-{
-    if (m_appState != AppConnectionState::SettingNetwork)
-        return;
-    onLogMessage("静态IP设置完成，开始认证...", 0);
-    startAuthentication();
-}
-
-void MainWindow::startAuthentication()
-{
-    setAppState(AppConnectionState::Authenticating);
-    onLogMessage("开始802.1X认证...", 0);
-
-    AuthConfig config = getCurrentConfig();
-    m_eapProcess->setConfig(config);
-    m_udpProcess->setConfig(config);
-
-    ui->btnDisconnect->setEnabled(true);
-    m_actionDisconnect->setEnabled(true);
-    m_trayIcon->setToolTip("SCUT 校园网认证 (连接中...)");
-
-    QMetaObject::invokeMethod(m_eapProcess, "start", Qt::QueuedConnection);
 }
 
 void MainWindow::on_btnDisconnect_clicked()
 {
-    if (m_appState == AppConnectionState::Disconnected)
+    if (m_sessionManager->state() == AppConnectionState::Disconnected)
         return;
 
-    QMetaObject::invokeMethod(m_eapProcess, "stop", Qt::QueuedConnection);
-    QMetaObject::invokeMethod(m_udpProcess, "stop", Qt::QueuedConnection);
-
-    restoreDhcp();
-    setAppState(AppConnectionState::Disconnected);
+    m_sessionManager->stopConnection();
 }
 
 // ============================================================================
-// DHCP 恢复
+// 统一状态 UI 更新
 // ============================================================================
 
-void MainWindow::restoreDhcp()
+void MainWindow::applyStateUI(AppConnectionState state)
 {
-    if (!m_wasStaticIpSet)
-        return;
-    m_wasStaticIpSet = false;
+    struct StateInfo {
+        const char* icon;
+        const char* text;
+        const char* hint;
+        const char* traySuffix;
+        const char* styleProp;
+        bool connected;
+        bool enabled;
+    };
 
-    QString adapterForNetsh = Network::adapterNameByMac(editMac->text().trimmed());
-    if (!adapterForNetsh.isEmpty()) {
-        QMetaObject::invokeMethod(m_networkWorker, "doSetDhcp", Qt::QueuedConnection,
-                                  Q_ARG(QString, adapterForNetsh));
-    }
-}
+    static const StateInfo kStateInfo[] = {
+        { "\xe2\x97\x8f", "未连接",           "点击下方按钮开始认证", " (未连接)",         "disconnected", false, true  },
+        { "\xe2\x97\x89", "正在配置网络...",   "正在设置静态IP及DNS",  " (配置网络中...)",  "connecting",   false, false },
+        { "\xe2\x97\x89", "正在认证...",       "正在发送802.1X认证包", " (认证中...)",      "connecting",   true,  true  },
+        { "\xe2\x97\x8f", "已连接",           "校园网已连接，可以上网", " (已连接)",         "connected",    true,  true  },
+    };
 
-// ============================================================================
-// 统一状态机
-// ============================================================================
+    const auto& info = kStateInfo[static_cast<int>(state)];
 
-void MainWindow::setConnectionUi(bool connected, bool enabled)
-{
-    ui->btnConnect->setEnabled(!connected);
-    ui->btnDisconnect->setEnabled(connected);
-    m_actionConnect->setEnabled(!connected);
-    m_actionDisconnect->setEnabled(connected);
+    // 按钮状态
+    ui->btnConnect->setEnabled(!info.connected);
+    ui->btnDisconnect->setEnabled(info.connected);
+    m_actionConnect->setEnabled(!info.connected);
+    m_actionDisconnect->setEnabled(info.connected);
 
-    if (!enabled) {
+    if (!info.enabled) {
         ui->btnConnect->setEnabled(false);
         ui->btnDisconnect->setEnabled(false);
         m_actionConnect->setEnabled(false);
         m_actionDisconnect->setEnabled(false);
     }
-}
 
-void MainWindow::setAppState(AppConnectionState state)
-{
-    m_appState = state;
+    // 标签
+    ui->labelStatusIcon->setText(QString::fromUtf8(info.icon));
+    ui->label_status->setText(QString::fromUtf8(info.text));
+    ui->labelStatusHint->setText(QString::fromUtf8(info.hint));
+    m_trayIcon->setToolTip(QStringLiteral("SCUT 校园网认证") + QString::fromUtf8(info.traySuffix));
 
-    const char* stateProp = "disconnected";
-    QString statusIcon;
-    QString statusText;
-    QString statusHint;
-    QString trayTooltip = "SCUT 校园网认证";
-
-    switch (state) {
-    case AppConnectionState::Disconnected:
-        setConnectionUi(false, true);
-        statusIcon  = "●";
-        statusText  = "未连接";
-        statusHint  = "点击下方按钮开始认证";
-        trayTooltip += " (未连接)";
-        stateProp   = "disconnected";
-        break;
-
-    case AppConnectionState::SettingNetwork:
-        setConnectionUi(false, false);
-        statusIcon  = "◉";
-        statusText  = "正在配置网络...";
-        statusHint  = "正在设置静态IP及DNS";
-        trayTooltip += " (配置网络中...)";
-        stateProp   = "connecting";
-        break;
-
-    case AppConnectionState::Authenticating:
-        setConnectionUi(true, true);
-        statusIcon  = "◉";
-        statusText  = "正在认证...";
-        statusHint  = "正在发送802.1X认证包";
-        trayTooltip += " (认证中...)";
-        stateProp   = "connecting";
-        break;
-
-    case AppConnectionState::Connected:
-        setConnectionUi(true, true);
-        statusIcon  = "●";
-        statusText  = "已连接";
-        statusHint  = "校园网已连接，可以上网";
-        trayTooltip += " (已连接)";
-        stateProp   = "connected";
-        break;
-    }
-
-    ui->label_status->setText(statusText);
-    ui->labelStatusIcon->setText(statusIcon);
-    ui->labelStatusHint->setText(statusHint);
-    m_trayIcon->setToolTip(trayTooltip);
-    ui->label_status->setProperty("state", stateProp);
-    ui->labelStatusIcon->setProperty("state", stateProp);
-
+    // 样式
+    ui->label_status->setProperty("state", info.styleProp);
+    ui->labelStatusIcon->setProperty("state", info.styleProp);
     ui->label_status->style()->unpolish(ui->label_status);
     ui->label_status->style()->polish(ui->label_status);
     ui->labelStatusIcon->style()->unpolish(ui->labelStatusIcon);
     ui->labelStatusIcon->style()->polish(ui->labelStatusIcon);
 }
 
+void MainWindow::onStateChanged(AppConnectionState state)
+{
+    applyStateUI(state);
+}
+
 // ============================================================================
-// 信号回调
+// 日志
 // ============================================================================
-
-void MainWindow::onEapStateChanged(AuthState state, const QString& message)
-{
-    if (!message.isEmpty())
-        onLogMessage(message, state == AuthState::Failed ? 2 : 0);
-    if (state == AuthState::Failed) {
-        onLogMessage("认证失败，正在恢复DHCP...", 1);
-        restoreDhcp();
-        setAppState(AppConnectionState::Disconnected);
-    } else if (state == AuthState::Stopped) {
-        setAppState(AppConnectionState::Disconnected);
-    }
-}
-
-void MainWindow::onUdpStateChanged(const QString& /*state*/, const QString& /*message*/)
-{
-    // 状态同步已由 UdpProcess::online() 信号处理
-    // 此槽位保留用于日志消息转发
-}
-
-void MainWindow::onEapSuccess(const QByteArray& md5Data)
-{
-    onLogMessage("认证成功，可以上网了！", 0);
-    setAppState(AppConnectionState::Connected);
-    m_udpProcess->setMd5Data(md5Data);
-    QMetaObject::invokeMethod(m_udpProcess, "start", Qt::QueuedConnection);
-}
-
-void MainWindow::onHeartbeatFailed()
-{
-    // 心跳超时由 UdpProcess::onHeartbeatTimeout 自动重发 Alive 自愈，
-    // 此处无需额外处理。偶尔超时是 DrCOM 协议的正常行为。
-}
 
 void MainWindow::onLogMessage(const QString& message, int level)
 {
+    // --- UI 显示 ---
     QString color;
+    const char* levelTag = "INFO";
     switch (static_cast<LogLevel>(level)) {
-    case LogLevel::Info:    color = "#9ca3af"; break;
-    case LogLevel::Warning: color = "#f59e0b"; break;
-    case LogLevel::Error:   color = "#ef4444"; break;
+    case LogLevel::Info:    color = QStringLiteral("#9ca3af"); levelTag = "INFO"; break;
+    case LogLevel::Warning: color = QStringLiteral("#f59e0b"); levelTag = "WARN"; break;
+    case LogLevel::Error:   color = QStringLiteral("#ef4444"); levelTag = "ERROR"; break;
     }
 
-    QString timestamp = QDateTime::currentDateTime().toString("hh:mm:ss");
+    QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("hh:mm:ss"));
     ui->textLog->appendHtml(
-        QString("<span style='color:%1;'>%2 %3</span>")
+        QStringLiteral("<span style='color:%1;'>%2 %3</span>")
             .arg(color, timestamp, message.toHtmlEscaped()));
     ui->textLog->moveCursor(QTextCursor::End);
+
+    // --- 文件日志持久化 ---
+    static const QString kLogDir =
+        QCoreApplication::applicationDirPath() + QStringLiteral("/log");
+    QDir().mkpath(kLogDir);
+
+    QString fileName = kLogDir + QStringLiteral("/SCUTNetLogin_")
+                       + QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd"))
+                       + QStringLiteral(".log");
+    QFile logFile(fileName);
+    if (logFile.open(QIODevice::Append | QIODevice::Text)) {
+        QTextStream stream(&logFile);
+        stream << QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd hh:mm:ss.zzz"))
+               << " [" << levelTag << "] " << message << Qt::endl;
+    }
 }
 
 // ============================================================================
@@ -731,7 +499,7 @@ void MainWindow::on_btnRefresh_clicked()
 void MainWindow::on_btnSaveConfig_clicked()
 {
     saveConfig();
-    QMessageBox::information(this, "成功", "配置已保存");
+    QMessageBox::information(this, QStringLiteral("成功"), QStringLiteral("配置已保存"));
 }
 
 // ============================================================================
@@ -740,13 +508,19 @@ void MainWindow::on_btnSaveConfig_clicked()
 
 AuthConfig MainWindow::getCurrentConfig()
 {
-    AuthConfig config;
-    config.username      = ui->editUsername->text();
-    config.password      = ui->editPassword->text();
-    config.host          = ui->editHost->text();
-    config.dnsServer     = ui->editDNSServer->text();
-    config.interfaceName = ui->comboInterface->currentData().toString();
-    config.hostname      = QHostInfo::localHostName();
+    AppConfig appCfg;
+    appCfg.username      = ui->editUsername->text();
+    appCfg.password      = ui->editPassword->text();
+    appCfg.host          = ui->editHost->text();
+    appCfg.dns           = ui->editDNSServer->text();
+    appCfg.interfaceName = ui->comboInterface->currentData().toString();
+    appCfg.manualMac     = ui->editMac->text();
+    appCfg.manualIp      = ui->editIp->text();
+
+    AuthConfig config = ConfigManager::toAuthConfig(appCfg);
+
+    // 运行时字段
+    config.hostname = QHostInfo::localHostName();
 
     QHostAddress srvAddr(config.dnsServer);
     if (srvAddr.protocol() == QAbstractSocket::IPv4Protocol)
@@ -754,32 +528,10 @@ AuthConfig MainWindow::getCurrentConfig()
     else
         memcpy(config.serverIp, DEFAULT_SERVER_IP.data(), DEFAULT_SERVER_IP.size());
 
-    // MAC — 标准化用户输入，若为空则从网卡自动获取
-    QString macStr = Network::normalizeMac(editMac->text().trimmed());
-    if (!macStr.isEmpty()) {
-        QByteArray bytes = QByteArray::fromHex(macStr.toLatin1());
-        memcpy(config.localMac, bytes.constData(), 6);
-    }
-    if (Network::isMacZero(config.localMac)) {
-        QNetworkInterface selectedIface =
-            QNetworkInterface::interfaceFromName(config.interfaceName);
-        if (selectedIface.isValid() && !selectedIface.hardwareAddress().isEmpty()) {
-            QString hw = Network::normalizeMac(selectedIface.hardwareAddress());
-            if (!hw.isEmpty()) {
-                QByteArray bytes = QByteArray::fromHex(hw.toLatin1());
-                memcpy(config.localMac, bytes.constData(), 6);
-            }
-        }
-    }
-
-    // IP
-    QHostAddress addr(editIp->text().trimmed());
-    if (addr.protocol() == QAbstractSocket::IPv4Protocol) {
-        Network::ipv4ToBytes(addr, config.localIp);
-    } else {
-        QNetworkInterface selectedIface =
-            QNetworkInterface::interfaceFromName(config.interfaceName);
-        for (const auto& entry : selectedIface.addressEntries()) {
+    // IP 回退：UI 未填时从当前网卡自动获取
+    if (Network::isIpZero(config.localIp) && !config.interfaceName.isEmpty()) {
+        QNetworkInterface iface = QNetworkInterface::interfaceFromName(config.interfaceName);
+        for (const auto& entry : iface.addressEntries()) {
             if (entry.ip().protocol() == QAbstractSocket::IPv4Protocol
                 && entry.ip().toIPv4Address() != 0) {
                 Network::ipv4ToBytes(entry.ip(), config.localIp);
