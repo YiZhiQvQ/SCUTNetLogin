@@ -182,14 +182,14 @@ void EapProcess::parseNotification(const QString& msg)
         QStringView prefix;
         int         codeOffset;  // code 子串起始位置（从 prefix 尾部算起）
     };
-    static constexpr CodePattern kCodePatterns[] = {
+    static const CodePattern kCodePatterns[] = {
         { QStringLiteral("userid error"),                 13 },
         { QStringLiteral("Authentication Fail ErrCode="), 28 },
     };
 
     // "code → 中文描述" 查找表（两个 pattern 共享），sleepReq 标记需休眠等待
     struct CodeMessage { QStringView code; const char* msg; bool sleepReq = false; };
-    static constexpr CodeMessage kCodeMessages[] = {
+    static const CodeMessage kCodeMessages[] = {
         { QStringLiteral("0"),  "用户名或密码错误" },
         { QStringLiteral("1"),  "账号不存在" },
         { QStringLiteral("2"),  "用户名或密码错误" },
@@ -220,7 +220,7 @@ void EapProcess::parseNotification(const QString& msg)
     }
 
     // --- 简单前缀匹配错误（无 code） ---
-    static constexpr struct { QStringView prefix; const char* msg; } kSimpleErrors[] = {
+    static const struct { QStringView prefix; const char* msg; } kSimpleErrors[] = {
         { QStringLiteral("AdminReset"),           "管理员已重置连接" },
         { QStringLiteral("Mac, IP, NASip, PORT"), "当前IP/MAC地址不允许登录" },
         { QStringLiteral("flowover"),             "流量已用尽" },
