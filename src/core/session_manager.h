@@ -3,10 +3,10 @@
 
 #include <QObject>
 #include <QThread>
-#include "protocol.h"
-#include "eap_process.h"
-#include "udp_process.h"
-#include "network_worker.h"
+#include "core/protocol.h"
+#include "eap/eap_process.h"
+#include "udp/udp_process.h"
+#include "network/network_worker.h"
 
 class LogManager;
 

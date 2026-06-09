@@ -1,6 +1,6 @@
-#include "config_manager.h"
-#include "constants.h"
-#include "network.h"
+#include "config/config_manager.h"
+#include "core/constants.h"
+#include "network/network.h"
 #include <QSettings>
 #include <QCoreApplication>
 #include <QHostAddress>

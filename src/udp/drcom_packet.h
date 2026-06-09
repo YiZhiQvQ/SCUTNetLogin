@@ -3,8 +3,8 @@
 
 #include <array>
 #include <cstdint>
-#include "protocol.h"
-#include "constants.h"
+#include "core/protocol.h"
+#include "core/constants.h"
 
 // ============================================================================
 // DrCOM UDP 私有协议封包 — 纯数据构造（无 I/O 依赖，可单独单测）

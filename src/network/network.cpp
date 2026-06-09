@@ -1,7 +1,7 @@
 #define _WIN32_WINNT 0x0601
 
-#include "network.h"
-#include "constants.h"
+#include "network/network.h"
+#include "core/constants.h"
 #include <winsock2.h>
 #include <windows.h>
 #include <iphlpapi.h>

@@ -14,32 +14,32 @@ QMAKE_LFLAGS += /MANIFESTUAC:\"level='requireAdministrator' uiAccess='false'\"
 
 SOURCES += \
     src/main.cpp \
-    src/mainwindow.cpp \
-    src/session_manager.cpp \
-    src/config_manager.cpp \
-    src/network_worker.cpp \
-    src/eap_process.cpp \
-    src/udp_process.cpp \
-    src/network.cpp \
-    src/drcom_packet.cpp \
-    src/eapol_packet.cpp \
-    src/log_manager.cpp
+    src/ui/mainwindow.cpp \
+    src/core/session_manager.cpp \
+    src/config/config_manager.cpp \
+    src/network/network_worker.cpp \
+    src/eap/eap_process.cpp \
+    src/udp/udp_process.cpp \
+    src/network/network.cpp \
+    src/udp/drcom_packet.cpp \
+    src/eap/eapol_packet.cpp \
+    src/log/log_manager.cpp
 
 HEADERS += \
-    src/mainwindow.h \
-    src/session_manager.h \
-    src/config_manager.h \
-    src/network_worker.h \
-    src/eap_process.h \
-    src/udp_process.h \
-    src/protocol.h \
-    src/network.h \
-    src/constants.h \
-    src/drcom_packet.h \
-    src/eapol_packet.h \
-    src/log_manager.h
+    src/ui/mainwindow.h \
+    src/core/session_manager.h \
+    src/config/config_manager.h \
+    src/network/network_worker.h \
+    src/eap/eap_process.h \
+    src/udp/udp_process.h \
+    src/core/protocol.h \
+    src/network/network.h \
+    src/core/constants.h \
+    src/udp/drcom_packet.h \
+    src/eap/eapol_packet.h \
+    src/log/log_manager.h
 
-FORMS += src/mainwindow.ui
+FORMS += src/ui/mainwindow.ui
 
 RESOURCES += res/resources.qrc
 

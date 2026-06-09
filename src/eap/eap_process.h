@@ -6,7 +6,7 @@
 #include <QElapsedTimer>
 #include <QMutex>
 #include <atomic>
-#include "protocol.h"
+#include "core/protocol.h"
 #include <pcap.h>
 
 class EapProcess : public QObject {

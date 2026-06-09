@@ -1,6 +1,6 @@
-#include "network_worker.h"
-#include "network.h"
-#include "constants.h"
+#include "network/network_worker.h"
+#include "network/network.h"
+#include "core/constants.h"
 #include <QProcess>
 #include <QCoreApplication>
 #include <QDir>

@@ -1,9 +1,9 @@
-#include "mainwindow.h"
+#include "ui/mainwindow.h"
 #include "ui_mainwindow.h"
-#include "constants.h"
-#include "config_manager.h"
-#include "network.h"
-#include "log_manager.h"
+#include "core/constants.h"
+#include "config/config_manager.h"
+#include "network/network.h"
+#include "log/log_manager.h"
 #include <QMessageBox>
 #include <QNetworkInterface>
 #include <QDateTime>

@@ -7,7 +7,7 @@
 #include <QMutex>
 #include <atomic>
 #include <array>
-#include "protocol.h"
+#include "core/protocol.h"
 
 class UdpProcess : public QObject {
     Q_OBJECT

@@ -2,7 +2,7 @@
 #define CONFIG_MANAGER_H
 
 #include <QString>
-#include "protocol.h"
+#include "core/protocol.h"
 
 // 配置持久化数据的纯数据结构 — 从 UI 控件解耦
 struct AppConfig {

@@ -1,4 +1,4 @@
-#include "log_manager.h"
+#include "log/log_manager.h"
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>

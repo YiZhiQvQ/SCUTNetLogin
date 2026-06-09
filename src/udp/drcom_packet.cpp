@@ -1,5 +1,5 @@
-#include "drcom_packet.h"
-#include "network.h"
+#include "udp/drcom_packet.h"
+#include "network/network.h"
 #include <QDateTime>
 #include <QHostAddress>
 #include <algorithm>

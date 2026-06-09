@@ -7,8 +7,8 @@
 #include <QAction>
 #include <QCloseEvent>
 
-#include "protocol.h"
-#include "session_manager.h"
+#include "core/protocol.h"
+#include "core/session_manager.h"
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }

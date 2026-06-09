@@ -1,7 +1,7 @@
-#include "session_manager.h"
-#include "constants.h"
-#include "network.h"
-#include "log_manager.h"
+#include "core/session_manager.h"
+#include "core/constants.h"
+#include "network/network.h"
+#include "log/log_manager.h"
 #include <QTimer>
 #include <QMetaObject>
 #include <QHostAddress>

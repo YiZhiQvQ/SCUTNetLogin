@@ -3,7 +3,7 @@
 
 #include <QObject>
 #include <QString>
-#include "protocol.h"
+#include "core/protocol.h"
 
 // ============================================================================
 // LogManager — 日志文件持久化（与 UI 彻底解耦）

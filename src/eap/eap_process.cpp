@@ -1,6 +1,6 @@
-#include "eap_process.h"
-#include "constants.h"
-#include "eapol_packet.h"
+#include "eap/eap_process.h"
+#include "core/constants.h"
+#include "eap/eapol_packet.h"
 #include <QThread>
 #include <winsock2.h>
 

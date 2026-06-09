@@ -1,4 +1,4 @@
-#include "eapol_packet.h"
+#include "eap/eapol_packet.h"
 #include <QCryptographicHash>
 #include <winsock2.h>
 #include <cstring>

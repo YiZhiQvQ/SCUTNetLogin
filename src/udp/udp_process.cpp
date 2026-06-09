@@ -1,7 +1,7 @@
-#include "udp_process.h"
-#include "constants.h"
-#include "network.h"
-#include "drcom_packet.h"
+#include "udp/udp_process.h"
+#include "core/constants.h"
+#include "network/network.h"
+#include "udp/drcom_packet.h"
 #include <QNetworkDatagram>
 #include <QHostInfo>
 #include <QRandomGenerator>
