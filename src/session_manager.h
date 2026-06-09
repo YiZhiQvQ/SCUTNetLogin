@@ -8,6 +8,8 @@
 #include "udp_process.h"
 #include "network_worker.h"
 
+class LogManager;
+
 // ============================================================================
 // 应用连接状态机 — 从 MainWindow 抽取，负责整个连接流程的编排
 // ============================================================================
@@ -57,12 +59,14 @@ private slots:
     void onStaticIpDone();
     void onStaticIpFailed(const QString& error);
     void onHeartbeatFailed();
+    void onReconnectTimeout();
 
 private:
     void initProcesses();
     void startAuth();       // EAP 认证阶段（静态IP完成后调用）
     void restoreDhcp();
     void setState(AppConnectionState state);
+    void scheduleReconnect();
 
     // --- 线程 & 工作对象 ---
     QThread        m_eapThread;
@@ -78,9 +82,15 @@ private:
     StaticIpConfig m_ipCfg;
     bool           m_wasStaticIpSet = false;
 
-    // --- 死连接检测 ---
+    // --- 日志 ---
+    LogManager*    m_logManager = nullptr;
+
+    // --- 自动重连 ---
+    QTimer* m_reconnectTimer = nullptr;
+    static constexpr int kReconnectIntervalMs = 5 * 60 * 1000;  // 5 分钟
+
+    // --- 心跳 ---
     int m_heartbeatFailCount = 0;
-    static constexpr int kMaxHeartbeatFailures = 3;
 };
 
 #endif // SESSION_MANAGER_H

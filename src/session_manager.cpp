@@ -1,9 +1,11 @@
 #include "session_manager.h"
 #include "constants.h"
 #include "network.h"
+#include "log_manager.h"
 #include <QTimer>
 #include <QMetaObject>
 #include <QHostAddress>
+#include <QDateTime>
 
 // ============================================================================
 // 构造 / 析构
@@ -44,8 +46,17 @@ void SessionManager::initProcesses()
     connect(m_eapProcess, &EapProcess::logMessage,   this, &SessionManager::logMessage);
     connect(m_eapProcess, &EapProcess::eapSuccess,   this, &SessionManager::onEapSuccess);
     connect(m_eapProcess, &EapProcess::sleepRequired, this, [this]() {
-        emit logMessage(QStringLiteral("当前时段禁止上网，已自动断开"), 2);
-        stopConnection();
+        const int hour = QDateTime::currentDateTime().time().hour();
+        if (hour < 6) {
+            emit logMessage(QStringLiteral("当前时段禁止上网，将在明早 6:00 自动重试"), 2);
+        } else {
+            emit logMessage(QStringLiteral("认证失败，将在 %1 分钟后自动重试")
+                            .arg(kReconnectIntervalMs / 60000), 1);
+        }
+        QMetaObject::invokeMethod(m_eapProcess, "stop", Qt::QueuedConnection);
+        QMetaObject::invokeMethod(m_udpProcess, "stop", Qt::QueuedConnection);
+        setState(AppConnectionState::Disconnected);
+        scheduleReconnect();
     });
     m_eapThread.start();
 
@@ -56,6 +67,9 @@ void SessionManager::initProcesses()
     connect(m_udpProcess, &UdpProcess::online,        this, &SessionManager::onUdpOnline);
     connect(m_udpProcess, &UdpProcess::logMessage,    this, &SessionManager::logMessage);
     connect(m_udpProcess, &UdpProcess::heartbeatFailed, this, &SessionManager::onHeartbeatFailed);
+    connect(m_udpProcess, &UdpProcess::heartbeatOk,     this, [this]() {
+        m_heartbeatFailCount = 0;  // 心跳成功后重置失败计数，仅连续失败才触发断连
+    });
     m_udpThread.start();
 
     // -- 网络配置线程（netsh/schtasks） --
@@ -65,6 +79,10 @@ void SessionManager::initProcesses()
     connect(m_networkWorker, &NetworkWorker::staticIpDone,   this, &SessionManager::onStaticIpDone);
     connect(m_networkWorker, &NetworkWorker::staticIpFailed, this, &SessionManager::onStaticIpFailed);
     m_networkThread.start();
+
+    // -- 日志文件持久化 --
+    m_logManager = new LogManager(this);
+    connect(this, &SessionManager::logMessage, m_logManager, &LogManager::onLogMessage);
 }
 
 // ============================================================================
@@ -121,6 +139,9 @@ void SessionManager::startAuth()
 
 void SessionManager::stopConnection()
 {
+    if (m_reconnectTimer)
+        m_reconnectTimer->stop();
+
     if (m_state == AppConnectionState::Disconnected)
         return;
 
@@ -173,9 +194,15 @@ void SessionManager::onEapStateChanged(AuthState state, const QString& message)
         emit logMessage(message, state == AuthState::Failed ? 2 : 0);
 
     if (state == AuthState::Failed) {
-        emit logMessage(QStringLiteral("认证失败，正在恢复DHCP..."), 1);
-        restoreDhcp();
+        const int hour = QDateTime::currentDateTime().time().hour();
+        if (hour < 6) {
+            emit logMessage(QStringLiteral("认证失败，将在明早 6:00 自动重试"), 1);
+        } else {
+            emit logMessage(QStringLiteral("认证失败，将在 %1 分钟后自动重试")
+                            .arg(kReconnectIntervalMs / 60000), 1);
+        }
         setState(AppConnectionState::Disconnected);
+        scheduleReconnect();
     } else if (state == AuthState::Stopped) {
         setState(AppConnectionState::Disconnected);
     }
@@ -183,7 +210,12 @@ void SessionManager::onEapStateChanged(AuthState state, const QString& message)
 
 void SessionManager::onEapSuccess(const QByteArray& md5Data)
 {
-    emit logMessage(QStringLiteral("认证成功，可以上网了！"), 0);
+    if (m_reconnectTimer && m_reconnectTimer->isActive()) {
+        m_reconnectTimer->stop();
+        emit logMessage(QStringLiteral("自动重连成功！"), 0);
+    } else {
+        emit logMessage(QStringLiteral("认证成功，可以上网了！"), 0);
+    }
     setState(AppConnectionState::Connected);
     m_udpProcess->setMd5Data(md5Data);
     QMetaObject::invokeMethod(m_udpProcess, "start", Qt::QueuedConnection);
@@ -211,10 +243,38 @@ void SessionManager::onStaticIpFailed(const QString& error)
 
 void SessionManager::onHeartbeatFailed()
 {
-    m_heartbeatFailCount++;
-    if (m_heartbeatFailCount >= kMaxHeartbeatFailures) {
-        emit logMessage(QStringLiteral("心跳连续失败 %1 次，连接可能已断开")
-                        .arg(m_heartbeatFailCount), 2);
-        stopConnection();
+    // DrCOM 服务器经常不回复心跳包但网络仍正常，心跳超时静默忽略
+}
+
+void SessionManager::scheduleReconnect()
+{
+    if (!m_reconnectTimer) {
+        m_reconnectTimer = new QTimer(this);
+        m_reconnectTimer->setSingleShot(true);
+        connect(m_reconnectTimer, &QTimer::timeout, this, &SessionManager::onReconnectTimeout);
     }
+    m_reconnectTimer->start(kReconnectIntervalMs);
+}
+
+void SessionManager::onReconnectTimeout()
+{
+    if (m_state != AppConnectionState::Disconnected)
+        return;
+
+    // 夜间 0:00-6:00 不重试，等到 6:00 再开始，避免通宵刷屏
+    const int hour = QDateTime::currentDateTime().time().hour();
+    if (hour < 6) {
+        QDateTime now = QDateTime::currentDateTime();
+        QDateTime sixAm(now.date(), QTime(6, 0));
+        qint64 msecsToSix = now.msecsTo(sixAm);
+        m_reconnectTimer->start(static_cast<int>(msecsToSix));
+        return;
+    }
+
+    emit logMessage(QStringLiteral("尝试重新连接..."), 0);
+
+    // 跳过静态IP设置阶段（IP 已在上次连接时配置好），直接开始认证
+    QMetaObject::invokeMethod(m_eapProcess, "stop", Qt::QueuedConnection);
+    QMetaObject::invokeMethod(m_udpProcess, "stop", Qt::QueuedConnection);
+    startAuth();
 }

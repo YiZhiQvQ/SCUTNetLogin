@@ -22,7 +22,8 @@ SOURCES += \
     src/udp_process.cpp \
     src/network.cpp \
     src/drcom_packet.cpp \
-    src/eapol_packet.cpp
+    src/eapol_packet.cpp \
+    src/log_manager.cpp
 
 HEADERS += \
     src/mainwindow.h \
@@ -35,7 +36,8 @@ HEADERS += \
     src/network.h \
     src/constants.h \
     src/drcom_packet.h \
-    src/eapol_packet.h
+    src/eapol_packet.h \
+    src/log_manager.h
 
 FORMS += src/mainwindow.ui
 

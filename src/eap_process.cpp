@@ -126,16 +126,6 @@ void EapProcess::sendEapResponse(uint8_t eapType, uint8_t requestId,
 }
 
 // ============================================================================
-// MD5 计算 — Ruijie/H3C 私有 EAP-MD5 扩展: MD5(id + password + challenge)
-// ============================================================================
-
-QByteArray EapProcess::calculateMD5(uint8_t identifier, const QString& password,
-                                     const QByteArray& challenge)
-{
-    return EapolPacket::calculateMD5(identifier, password, challenge);
-}
-
-// ============================================================================
 // 收包解析
 // ============================================================================
 
@@ -395,7 +385,7 @@ void EapProcess::handleEapRequest(const EAPHeader& hdr, const QByteArray& payloa
         if (payload.size() > 1) {
             uint8_t md5Size = static_cast<uint8_t>(payload[0]);
             QByteArray challenge = payload.mid(1, md5Size);
-            m_md5Result = calculateMD5(hdr.id, m_config.password, challenge);
+            m_md5Result = EapolPacket::calculateMD5(hdr.id, m_config.password, challenge);
 
             QByteArray md5Payload = EapolPacket::buildMd5ChallengePayload(
                 m_md5Result, userUtf8, m_config.localIp);
@@ -428,14 +418,21 @@ void EapProcess::onPollTimeout()
 
     QMutexLocker locker(&m_mutex);
 
+    // 先收集所有包的处理结果，再决定是否 stop()
+    // stop() 内部会加锁，因此必须在 locker 作用域外调用
     const auto packets = drainPackets();
+    bool fatalError = false;
     for (const auto& pkt : packets) {
         if (!processEapPacket(pkt)) {
-            // 致命错误 (EAP_FAILURE) — 必须先解锁再 stop（stop 内部会加锁）
-            locker.unlock();
-            stop();
-            return;
+            fatalError = true;
+            break;
         }
+    }
+
+    if (fatalError) {
+        locker.unlock();
+        stop();
+        return;
     }
 
     checkRetransmit();

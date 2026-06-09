@@ -13,7 +13,10 @@ std::vector<uint8_t> buildEapolFrame(const uint8_t* srcMac,
                                       uint8_t eapolType,
                                       uint16_t eapolBodyLen)
 {
-    std::vector<uint8_t> frame(EAPOL_FRAME_BUFFER_SIZE, 0);
+    // 动态分配精确帧大小: Eth头(14) + EAPOL头(4) + EAPOL body
+    // 避免中文用户名等长 payload 导致固定 96 字节缓冲区溢出
+    const size_t frameSize = ETH_HEADER_SIZE + sizeof(EAPOLHeader) + eapolBodyLen;
+    std::vector<uint8_t> frame(frameSize, 0);
     EthHeader*   eth   = reinterpret_cast<EthHeader*>(frame.data());
     EAPOLHeader* eapol = reinterpret_cast<EAPOLHeader*>(frame.data() + ETH_HEADER_SIZE);
 

@@ -26,7 +26,8 @@ signals:
     void stateChanged(const QString& state, const QString& message);
     void online();              // UDP 握手完成，进入在线心跳状态
     void logMessage(const QString& message, int level);
-    void heartbeatFailed();
+    void heartbeatFailed();     // 单次心跳超时
+    void heartbeatOk();         // 心跳周期成功完成（用于重置连续失败计数）
 
 private slots:
     void onReadyRead();
@@ -43,7 +44,8 @@ private:
 
     mutable QMutex m_mutex;
     AuthConfig m_config;
-    QByteArray m_md5Data;               // EAP-MD5 结果; sendMiscInfo 覆盖前 4 字节为 cks32
+    QByteArray m_md5Result;             // EAP-MD5 原始结果（16字节，不可变）
+    uint32_t   m_cks32 = 0;             // MiscInfo 校验和（sendMiscInfo 中计算，sendAlive 中拼入前 4 字节）
     std::array<uint8_t, 16> m_decryptedInfo{};
     std::array<uint8_t, 4>  m_flux{};
     std::array<uint8_t, 2>  m_rnd{};

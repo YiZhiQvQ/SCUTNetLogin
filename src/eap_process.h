@@ -53,8 +53,6 @@ private:
     void parseNotification(const QString& msg);
 
     bool parsePacket(const QByteArray& data, EAPHeader* outEapHeader, QByteArray* outPayload);
-    QByteArray calculateMD5(uint8_t identifier, const QString& password,
-                            const QByteArray& challenge);
     void log(LogLevel level, const QString& msg);
 
     static bool isMulticastMac(const uint8_t* mac);

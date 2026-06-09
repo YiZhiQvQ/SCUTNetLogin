@@ -3,11 +3,11 @@
 #include "constants.h"
 #include "config_manager.h"
 #include "network.h"
+#include "log_manager.h"
 #include <QMessageBox>
 #include <QNetworkInterface>
 #include <QDateTime>
 #include <QTimer>
-#include <QHostInfo>
 #include <QApplication>
 #include <QRegularExpression>
 #include <QIcon>
@@ -16,9 +16,6 @@
 #include <QTextCursor>
 #include <QClipboard>
 #include <QStyle>
-#include <QDir>
-#include <QFile>
-#include <QTextStream>
 
 
 // ============================================================================
@@ -73,7 +70,6 @@ MainWindow::MainWindow(QWidget* parent)
 
     connect(ui->btnCopyLog, &QPushButton::clicked, this, [this]() {
         QGuiApplication::clipboard()->setText(ui->textLog->toPlainText());
-        onLogMessage(QStringLiteral("日志已复制到剪贴板"), 0);
     });
 
     connect(ui->btnClearLog, &QPushButton::clicked, this, [this]() {
@@ -399,20 +395,21 @@ void MainWindow::on_btnDisconnect_clicked()
 void MainWindow::applyStateUI(AppConnectionState state)
 {
     struct StateInfo {
-        const char* icon;
-        const char* text;
-        const char* hint;
-        const char* traySuffix;
-        const char* styleProp;
+        QString icon;
+        QString text;
+        QString hint;
+        QString traySuffix;
+        QString styleProp;
         bool connected;
         bool enabled;
     };
 
     static const StateInfo kStateInfo[] = {
-        { "\xe2\x97\x8f", "未连接",           "点击下方按钮开始认证", " (未连接)",         "disconnected", false, true  },
-        { "\xe2\x97\x89", "正在配置网络...",   "正在设置静态IP及DNS",  " (配置网络中...)",  "connecting",   false, false },
-        { "\xe2\x97\x89", "正在认证...",       "正在发送802.1X认证包", " (认证中...)",      "connecting",   true,  true  },
-        { "\xe2\x97\x8f", "已连接",           "校园网已连接，可以上网", " (已连接)",         "connected",    true,  true  },
+        // ● = U+25CF (已连接/未连接空心), ◉ = U+25C9 (过渡态实心)
+        { QStringLiteral("●"), QStringLiteral("未连接"),           QStringLiteral("点击下方按钮开始认证"), QStringLiteral(" (未连接)"),         QStringLiteral("disconnected"), false, true  },
+        { QStringLiteral("◉"), QStringLiteral("正在配置网络..."),   QStringLiteral("正在设置静态IP及DNS"),  QStringLiteral(" (配置网络中...)"),  QStringLiteral("connecting"),   false, false },
+        { QStringLiteral("◉"), QStringLiteral("正在认证..."),       QStringLiteral("正在发送802.1X认证包"), QStringLiteral(" (认证中...)"),      QStringLiteral("connecting"),   true,  true  },
+        { QStringLiteral("●"), QStringLiteral("已连接"),           QStringLiteral("校园网已连接，可以上网"), QStringLiteral(" (已连接)"),         QStringLiteral("connected"),    true,  true  },
     };
 
     const auto& info = kStateInfo[static_cast<int>(state)];
@@ -431,10 +428,10 @@ void MainWindow::applyStateUI(AppConnectionState state)
     }
 
     // 标签
-    ui->labelStatusIcon->setText(QString::fromUtf8(info.icon));
-    ui->label_status->setText(QString::fromUtf8(info.text));
-    ui->labelStatusHint->setText(QString::fromUtf8(info.hint));
-    m_trayIcon->setToolTip(QStringLiteral("SCUT 校园网认证") + QString::fromUtf8(info.traySuffix));
+    ui->labelStatusIcon->setText(info.icon);
+    ui->label_status->setText(info.text);
+    ui->labelStatusHint->setText(info.hint);
+    m_trayIcon->setToolTip(QStringLiteral("SCUT 校园网认证") + info.traySuffix);
 
     // 样式
     ui->label_status->setProperty("state", info.styleProp);
@@ -456,35 +453,8 @@ void MainWindow::onStateChanged(AppConnectionState state)
 
 void MainWindow::onLogMessage(const QString& message, int level)
 {
-    // --- UI 显示 ---
-    QString color;
-    const char* levelTag = "INFO";
-    switch (static_cast<LogLevel>(level)) {
-    case LogLevel::Info:    color = QStringLiteral("#9ca3af"); levelTag = "INFO"; break;
-    case LogLevel::Warning: color = QStringLiteral("#f59e0b"); levelTag = "WARN"; break;
-    case LogLevel::Error:   color = QStringLiteral("#ef4444"); levelTag = "ERROR"; break;
-    }
-
-    QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("hh:mm:ss"));
-    ui->textLog->appendHtml(
-        QStringLiteral("<span style='color:%1;'>%2 %3</span>")
-            .arg(color, timestamp, message.toHtmlEscaped()));
+    ui->textLog->appendHtml(LogManager::formatHtml(message, level));
     ui->textLog->moveCursor(QTextCursor::End);
-
-    // --- 文件日志持久化 ---
-    static const QString kLogDir =
-        QCoreApplication::applicationDirPath() + QStringLiteral("/log");
-    QDir().mkpath(kLogDir);
-
-    QString fileName = kLogDir + QStringLiteral("/SCUTNetLogin_")
-                       + QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd"))
-                       + QStringLiteral(".log");
-    QFile logFile(fileName);
-    if (logFile.open(QIODevice::Append | QIODevice::Text)) {
-        QTextStream stream(&logFile);
-        stream << QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd hh:mm:ss.zzz"))
-               << " [" << levelTag << "] " << message << Qt::endl;
-    }
 }
 
 // ============================================================================
@@ -518,27 +488,6 @@ AuthConfig MainWindow::getCurrentConfig()
     appCfg.manualIp      = ui->editIp->text();
 
     AuthConfig config = ConfigManager::toAuthConfig(appCfg);
-
-    // 运行时字段
-    config.hostname = QHostInfo::localHostName();
-
-    QHostAddress srvAddr(config.dnsServer);
-    if (srvAddr.protocol() == QAbstractSocket::IPv4Protocol)
-        Network::ipv4ToBytes(srvAddr, config.serverIp);
-    else
-        memcpy(config.serverIp, DEFAULT_SERVER_IP.data(), DEFAULT_SERVER_IP.size());
-
-    // IP 回退：UI 未填时从当前网卡自动获取
-    if (Network::isIpZero(config.localIp) && !config.interfaceName.isEmpty()) {
-        QNetworkInterface iface = QNetworkInterface::interfaceFromName(config.interfaceName);
-        for (const auto& entry : iface.addressEntries()) {
-            if (entry.ip().protocol() == QAbstractSocket::IPv4Protocol
-                && entry.ip().toIPv4Address() != 0) {
-                Network::ipv4ToBytes(entry.ip(), config.localIp);
-                break;
-            }
-        }
-    }
-
+    ConfigManager::resolveAuthConfig(config);
     return config;
 }

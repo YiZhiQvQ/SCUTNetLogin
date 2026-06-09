@@ -30,7 +30,7 @@ DrcomMiscInfo buildMiscInfo(const AuthConfig& config, const uint8_t* flux)
     DrcomMiscInfo info = {};
 
     info.magic   = DRCOM_UDP_MAGIC;
-    info.subtype = 0x01;
+    info.subtype = DRCOM_MISC_INFO_CMD;
     info.length  = DRCOM_MISC_INFO_LENGTH;
     info.flag    = DRCOM_MISC_INFO_FLAG;
 
@@ -113,7 +113,7 @@ DrcomMiscHeartbeat buildMiscHeartbeat(uint8_t counter, uint8_t hbSubtype,
     if (flux)
         memcpy(hb.flux, flux, 4);
 
-    if (hbSubtype == 0x03 && localIp)
+    if (hbSubtype == DRCOM_HB_CLIENT_CONFIRM && localIp)
         memcpy(hb.local_ip, localIp, 4);
 
     return hb;

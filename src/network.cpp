@@ -8,11 +8,47 @@
 #include <QProcess>
 #include <QRegularExpression>
 #include <QNetworkInterface>
+#include <QSet>
 #include <vector>
 #include <QDebug>
 #include <pcap.h>
 
 namespace Network {
+
+// ============================================================================
+// 共享 Win32 适配器枚举 — findInterface / findAdapterGuidByMac / listInterfaces 共用
+// ============================================================================
+
+struct RawWin32Adapter {
+    QString guid;           // AdapterName, e.g. "{XXXXXXXX-...}"
+    QString description;    // Description (friendly name)
+    BYTE    mac[8]{};       // PhysicalAddress (max 8, typically 6)
+    ULONG   macLen = 0;
+    DWORD   ifType = 0;
+};
+
+static std::vector<RawWin32Adapter> enumerateWin32Adapters()
+{
+    std::vector<RawWin32Adapter> result;
+    ULONG bufLen = 0;
+    GetAdaptersAddresses(AF_INET, 0, nullptr, nullptr, &bufLen);
+    std::vector<BYTE> buf(bufLen);
+    PIP_ADAPTER_ADDRESSES adapters =
+        reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
+    if (GetAdaptersAddresses(AF_INET, 0, nullptr, adapters, &bufLen) == NO_ERROR) {
+        for (PIP_ADAPTER_ADDRESSES a = adapters; a; a = a->Next) {
+            RawWin32Adapter ra;
+            ra.guid        = QString::fromLatin1(a->AdapterName);
+            ra.description = QString::fromWCharArray(a->Description);
+            ra.ifType      = a->IfType;
+            ra.macLen      = a->PhysicalAddressLength;
+            if (ra.macLen > 0 && ra.macLen <= sizeof(ra.mac))
+                memcpy(ra.mac, a->PhysicalAddress, ra.macLen);
+            result.push_back(ra);
+        }
+    }
+    return result;
+}
 
 // ============================================================================
 // findInterface — 将 pcap 设备名 / 描述映射到 Windows QNetworkInterface
@@ -21,37 +57,30 @@ namespace Network {
 QNetworkInterface findInterface(const QString& pcapName,
                                 const QString& pcapDescription)
 {
-    QRegularExpression re(R"(\\Device\\NPF_\{([A-Fa-f0-9\-]+)\})");
-    auto match = re.match(pcapName);
-
+    // Strategy 1: extract GUID from pcap device name → QNetworkInterface
+    static const QRegularExpression guidRe(R"(\\Device\\NPF_\{([A-Fa-f0-9\-]+)\})");
+    auto match = guidRe.match(pcapName);
     if (match.hasMatch()) {
-        QString guid = "{" + match.captured(1) + "}";
+        const QString guid = QStringLiteral("{") + match.captured(1) + QStringLiteral("}");
         for (const QNetworkInterface& iface : QNetworkInterface::allInterfaces()) {
             if (iface.name().compare(guid, Qt::CaseInsensitive) == 0)
                 return iface;
         }
     }
 
+    // Strategy 2: match by human-readable description (Qt)
     if (!pcapDescription.isEmpty()) {
         for (const QNetworkInterface& iface : QNetworkInterface::allInterfaces()) {
             if (iface.humanReadableName().compare(pcapDescription, Qt::CaseInsensitive) == 0)
                 return iface;
         }
 
-        ULONG bufLen = 0;
-        GetAdaptersAddresses(AF_INET, 0, nullptr, nullptr, &bufLen);
-        std::vector<BYTE> buf(bufLen);
-        PIP_ADAPTER_ADDRESSES adapters =
-            reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
-        if (GetAdaptersAddresses(AF_INET, 0, nullptr, adapters, &bufLen) == NO_ERROR) {
-            for (PIP_ADAPTER_ADDRESSES a = adapters; a; a = a->Next) {
-                QString desc = QString::fromWCharArray(a->Description);
-                if (desc.compare(pcapDescription, Qt::CaseInsensitive) == 0) {
-                    QString guid = QString::fromLatin1(a->AdapterName);
-                    QNetworkInterface iface = QNetworkInterface::interfaceFromName(guid);
-                    if (iface.isValid())
-                        return iface;
-                }
+        // Strategy 3: match by description via Win32 GetAdaptersAddresses fallback
+        for (const auto& ra : enumerateWin32Adapters()) {
+            if (ra.description.compare(pcapDescription, Qt::CaseInsensitive) == 0) {
+                QNetworkInterface iface = QNetworkInterface::interfaceFromName(ra.guid);
+                if (iface.isValid())
+                    return iface;
             }
         }
     }
@@ -77,29 +106,20 @@ AdapterInfo adapterInfo(const QString& pcapName, const QString& pcapDescription)
 
 static QString findAdapterGuidByMac(const QString& normalizedMac)
 {
+    // Try Qt first
     for (const QNetworkInterface& iface : QNetworkInterface::allInterfaces()) {
-        QString hw = normalizeMac(iface.hardwareAddress());
-        if (hw == normalizedMac)
+        if (normalizeMac(iface.hardwareAddress()) == normalizedMac)
             return iface.name();
     }
 
-    ULONG bufLen = 0;
-    GetAdaptersAddresses(AF_INET, 0, nullptr, nullptr, &bufLen);
-    std::vector<BYTE> buf(bufLen);
-    PIP_ADAPTER_ADDRESSES adapters =
-        reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
-    if (GetAdaptersAddresses(AF_INET, 0, nullptr, adapters, &bufLen) == NO_ERROR) {
-        for (PIP_ADAPTER_ADDRESSES a = adapters; a; a = a->Next) {
-            if (a->PhysicalAddressLength != 6)
-                continue;
-            QString hw;
-            for (ULONG i = 0; i < a->PhysicalAddressLength; ++i)
-                hw += QString("%1").arg(a->PhysicalAddress[i], 2, 16, QLatin1Char('0'));
-            if (hw.toUpper() == normalizedMac) {
-                QString guid = QString::fromLatin1(a->AdapterName);
-                QNetworkInterface iface = QNetworkInterface::interfaceFromName(guid);
-                return iface.isValid() ? iface.name() : guid;
-            }
+    // Win32 fallback (uses shared enumeration)
+    for (const auto& ra : enumerateWin32Adapters()) {
+        if (ra.macLen != 6)
+            continue;
+        const QByteArray macBytes(reinterpret_cast<const char*>(ra.mac), 6);
+        if (QString::fromLatin1(macBytes.toHex().toUpper()) == normalizedMac) {
+            QNetworkInterface iface = QNetworkInterface::interfaceFromName(ra.guid);
+            return iface.isValid() ? iface.name() : ra.guid;
         }
     }
 
@@ -124,8 +144,17 @@ QString adapterNameByMac(const QString& mac)
 
 QList<InterfaceEntry> listInterfaces()
 {
+    // 构建 Wi-Fi GUID 集合（Win32 IfType，精确可靠）
+    const auto win32Adapters = enumerateWin32Adapters();
+    QSet<QString> wifiGuids;
+    for (const auto& ra : win32Adapters) {
+        if (ra.ifType == IF_TYPE_IEEE80211)
+            wifiGuids.insert(ra.guid.toUpper());
+    }
+
     QList<InterfaceEntry> result;
     QList<InterfaceEntry> wireless;
+    static const QRegularExpression guidRe(R"(\\Device\\NPF_\{([A-Fa-f0-9\-]+)\})");
 
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_if_t* alldevs;
@@ -134,22 +163,30 @@ QList<InterfaceEntry> listInterfaces()
         for (pcap_if_t* dev = alldevs; dev != nullptr; dev = dev->next) {
             if (dev->flags & PCAP_IF_LOOPBACK)
                 continue;
-            QString desc = dev->description ? QString::fromLocal8Bit(dev->description) : QString();
-            QString name = QString::fromUtf8(dev->name);
-            if (desc.contains("Loopback", Qt::CaseInsensitive)
-                || name.contains("Loopback", Qt::CaseInsensitive))
+            const QString desc = dev->description ? QString::fromLocal8Bit(dev->description) : QString();
+            const QString name = QString::fromUtf8(dev->name);
+            if (desc.contains(QStringLiteral("Loopback"), Qt::CaseInsensitive)
+                || name.contains(QStringLiteral("Loopback"), Qt::CaseInsensitive))
                 continue;
 
+            // 优先通过 Win32 IfType 检测 Wi-Fi，回退到字符串匹配
             bool isWireless = false;
-            for (const QString& key : wifiKeys) {
-                if (desc.contains(key, Qt::CaseInsensitive)
-                    || name.contains(key, Qt::CaseInsensitive)) {
-                    isWireless = true;
-                    break;
+            auto match = guidRe.match(name);
+            if (match.hasMatch()) {
+                const QString guid = QStringLiteral("{") + match.captured(1) + QStringLiteral("}");
+                isWireless = wifiGuids.contains(guid.toUpper());
+            }
+            if (!isWireless) {
+                for (const QString& key : wifiKeys) {
+                    if (desc.contains(key, Qt::CaseInsensitive)
+                        || name.contains(key, Qt::CaseInsensitive)) {
+                        isWireless = true;
+                        break;
+                    }
                 }
             }
 
-            QString displayName = desc.isEmpty() ? name : desc;
+            const QString displayName = desc.isEmpty() ? name : desc;
             if (isWireless)
                 wireless.append({displayName, name, true});
             else
@@ -160,7 +197,7 @@ QList<InterfaceEntry> listInterfaces()
 
     // Wi-Fi 网卡排到列表末尾，加前缀区分
     for (const auto& w : wireless)
-        result.append({"[Wi-Fi] " + w.displayName, w.pcapName, true});
+        result.append({QStringLiteral("[Wi-Fi] ") + w.displayName, w.pcapName, true});
 
     return result;
 }
