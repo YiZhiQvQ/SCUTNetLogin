@@ -1,0 +1,81 @@
+# ============================================================
+# SCUTNetLogin - 只跟踪源码，忽略全部构建产物与副产物
+# 注意：gitignore 的行内 "# 注释" 会被并入模式本身，故注释单独成行。
+# ============================================================
+
+# ---- 构建产物 ----
+build/
+build2/
+build_msvc/
+build_py/
+build_release/
+build_opt/
+debug/
+release/
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.res
+*.user
+*.aps
+*.qtvscr
+*.log
+stdout.txt
+stderr.txt
+
+# ---- qmake 生成物 ----
+.qmake.stash
+Makefile
+Makefile.Debug
+Makefile.Release
+ui_mainwindow.h
+moc_*.cpp
+qrc_*.cpp
+
+# ---- Qt Creator ----
+*.pro.user
+*.pro.user.*
+
+# ---- VS 工程文件（由 Qt VS Tools 从 .pro 生成，不入库）----
+*.sln
+*.vcxproj
+*.vcxproj.filters
+.vs/
+
+# ---- 副产物 / 本机生成 ----
+installer_create/
+ui_preview/
+rel_verify/
+build_final.bat
+tools/installer/build/
+log/
+
+# ---- 测试辅助脚本 / 产物（测试源码 tst_packets.* 保留入库）----
+tests/build_test.bat
+tests/run_test.bat
+tests/run_test.ps1
+tests/release/
+tests/Makefile
+tests/Makefile.Debug
+tests/Makefile.Release
+tests/*.exe
+tests/*.moc
+tests/*_out.txt
+tests/ps_*.txt
+tests/test_results.txt
+
+# ---- Python ----
+__pycache__/
+*.pyc
+
+# ---- 本机 / 个人文件 ----
+.claude/
+CLAUDE.md
+website/
+SCUT校园网DrCOM认证流程.md
+needcommit.md
+
+# git 自身
+.gitignore

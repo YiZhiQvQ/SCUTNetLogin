@@ -1,0 +1,12 @@
+#include <windows.h>
+IDI_ICON1 ICON "res/SCUTnetwork.ico"
+// 嵌入管理员权限清单（标准模板，含正确引号）
+//
+// qmake 路径（.pro: CONFIG -= embed_manifest_exe + QMAKE_LFLAGS 引号问题）依赖
+// .rc 嵌入这份 manifest，因此默认嵌入。
+// VS/Qt VS Tools 路径由 linker 注入 /MANIFESTDEPENDENCY 自动生成 manifest
+// （UACExecutionLevel 来自 vcxproj），若同时嵌入会触发 CVT1100: MANIFEST 资源重复；
+// vcxproj 已给 RC 定义 NO_EMBED_MANIFEST 将此分支排除。
+#ifndef NO_EMBED_MANIFEST
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+#endif
