@@ -56,6 +56,10 @@ public:
     // 开机自启（通过 Windows Task Scheduler）
     void setAutoStart(bool enable);
 
+    // 调试输出开关：开启后 SessionManager 输出详细连接决策诊断，并转发给
+    // EAP/UDP/WiFi 工作进程输出各自帧级/阶段级追踪。立即生效（无需重启）。
+    void setDebugLogEnabled(bool on);
+
     // 系统从待机/睡眠唤醒时由 MainWindow（native event filter）调用：
     // 睡眠期间 Qt 定时器基于单调时钟（部分电源状态下不走/不准），
     // 重连排程（如"距 6:00 再试"）会被整体顺延；唤醒后用墙钟重新评估。
@@ -94,8 +98,14 @@ private:
     void startLinkWatch();
     void stopLinkWatch();
 
-    // auto 模式的后端决策（现场取链路/SSID，纯函数决定）
-    ConnectionBuilder::BackendDecision decideBackend() const;
+    // auto 模式的后端决策（现场取链路/SSID，纯函数决定；非 const 因需要在
+    // 调试开启时输出决策依据诊断行）
+    ConnectionBuilder::BackendDecision decideBackend();
+
+    // 调试输出：仅 m_debugLog 时发射 logMessage，统一加 [调试] 前缀
+    void debugLog(const QString& message);
+    // 逐行输出多行适配器枚举（Network::dumpAdapters 结果拆行逐条 debugLog）
+    void logAdapterDump(const QString& dump);
 
     // 无线 "Online" 回调的"仍应生效"守卫：仅当当前会话仍是无线后端且状态处于
     // 连接中/已连接才接受（防止用户断开后滞后的 Online 信号把状态翻回 Connected）
@@ -169,6 +179,7 @@ private:
 
     // --- 日志 ---
     LogManager*    m_logManager = nullptr;
+    bool           m_debugLog   = false;   // 调试输出开关（见 setDebugLogEnabled）
 
     // --- 自动重连 ---
     QTimer* m_reconnectTimer = nullptr;

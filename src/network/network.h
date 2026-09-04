@@ -57,6 +57,11 @@ QStringList connectedEthernetGuids();
 // 自动排除 VMware/Hyper-V/TAP/蓝牙/USB NDIS 等虚拟适配器
 bool ethernetLinkUp();
 
+// 调试诊断：逐条枚举全部 Win32 适配器（GUID/描述/ifType/oper-status/MAC/是否被
+// 过滤为虚拟/是否计入"物理有线链路 Up"），末尾给 ethernetLinkUp() 判定汇总。
+// 返回多行文本，供调试输出定位"为什么这台机器一直判定有线"。
+QString dumpAdapters();
+
 // 注：wlanapi 相关封装（currentWifiConnection / wifiDefaultGateway）已移至
 // wifi/wlan_media.h（仅无线模块使用；无线断开采用门户 mac/unbind 解绑，
 // 不做物理断开，故不再需要 WlanDisconnect）

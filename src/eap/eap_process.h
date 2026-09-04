@@ -23,6 +23,8 @@ public:
     ~EapProcess() override;
 
     void setConfig(AuthConfig config);
+    // 调试输出开关：开启后收发 EAPOL 帧输出原始 hex（worker 线程原子自读）
+    void setDebugLogEnabled(bool on);
 
 public slots:
     void start();
@@ -102,6 +104,7 @@ private:
 
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_stopRequested{false};
+    std::atomic<bool> m_debugLog{false};   // 调试输出（帧级 hex）
     AuthState m_currentState = AuthState::Idle;
 
     // start 代数：start()/stop()/restart() 各递增一次。所有异步延续

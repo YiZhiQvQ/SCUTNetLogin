@@ -6,6 +6,25 @@
 #include <QHostInfo>
 #include <QRandomGenerator>
 
+namespace {
+
+// DrCOM UDP 子类型 → 可读名称（调试输出用）。0x0b 之后的心跳包子类型见
+// DRCOM_HB_SUBTYPE_*（仅 debug 回显，无协议语义）。
+QString udpSubtypeName(uint8_t s)
+{
+    switch (s) {
+    case DRCOM_SUBTYPE_MISC_ALIVE:           return QStringLiteral("MiscAlive(请求)");
+    case DRCOM_SUBTYPE_MISC_RESPONSE_ALIVE:  return QStringLiteral("MiscResponseAlive(响应)");
+    case DRCOM_SUBTYPE_MISC_INFO:            return QStringLiteral("MiscInfo");
+    case DRCOM_SUBTYPE_MISC_RESPONSE_INFO:   return QStringLiteral("MiscResponseInfo(解密信息)");
+    case DRCOM_SUBTYPE_MISC_HEARTBEAT_ALIVE: return QStringLiteral("HeartbeatAlive(响应)");
+    case DRCOM_SUBTYPE_MISC_HEARTBEAT:       return QStringLiteral("Heartbeat");
+    default: return QStringLiteral("0x%1").arg(s, 2, 16, QLatin1Char('0')).toUpper();
+    }
+}
+
+} // namespace
+
 // ============================================================================
 // 构造 / 析构
 // ============================================================================
@@ -41,6 +60,11 @@ void UdpProcess::setMd5Data(const QByteArray& md5Data)
 {
     QMutexLocker locker(&m_mutex);
     m_md5Result = md5Data;
+}
+
+void UdpProcess::setDebugLogEnabled(bool on)
+{
+    m_debugLog.store(on);
 }
 
 // ============================================================================
@@ -101,6 +125,18 @@ void UdpProcess::flushPending()
 
 void UdpProcess::sendUdpPacket(const char* data, size_t len)
 {
+    if (m_debugLog.load()) {
+        const QByteArray frame(data, static_cast<int>(len));
+        QString label = QStringLiteral("UDP?");
+        if (len >= 1 && static_cast<uint8_t>(data[0]) == DRCOM_ALIVE_MAGIC)
+            label = QStringLiteral("Alive");
+        else if (len >= sizeof(DrcomUdpHeader)
+                 && static_cast<uint8_t>(data[0]) == DRCOM_UDP_MAGIC)
+            label = udpSubtypeName(reinterpret_cast<const DrcomUdpHeader*>(data)->subtype);
+        log(LogLevel::Info, QStringLiteral("[调试][UDP 发] %1 %2")
+                                .arg(label, ByteUtils::hexDump(frame)));
+    }
+
     qint64 written = m_socket->write(data, static_cast<qint64>(len));
     // 发送失败/部分发送【静默】处理：
     // 本网络环境服务器不响应 UDP 心跳属常见现象（不影响上网），且心跳失败在
@@ -151,7 +187,8 @@ void UdpProcess::start()
             QHostAddress serverAddr = hostInfo.addresses().first();
 
             m_socket->connectToHost(serverAddr, DRCOM_UDP_PORT);
-            log(LogLevel::Info, QStringLiteral("连接 UDP 服务器: %1:%2").arg(serverAddr.toString()).arg(DRCOM_UDP_PORT));
+            if (m_debugLog.load())
+                log(LogLevel::Info, QStringLiteral("[调试] 连接 UDP 服务器: %1:%2").arg(serverAddr.toString()).arg(DRCOM_UDP_PORT));
             sendMiscAlive();
             locker.unlock();
             flushPending();
@@ -286,6 +323,11 @@ void UdpProcess::onReadyRead() {
         if (hdr->magic != DRCOM_UDP_MAGIC)
             continue;
 
+        if (m_debugLog.load()) {
+            log(LogLevel::Info, QStringLiteral("[调试][UDP 收] %1 %2")
+                                    .arg(udpSubtypeName(hdr->subtype), ByteUtils::hexDump(data)));
+        }
+
         m_timeoutTimer->stop();
 
         switch (hdr->subtype) {
@@ -302,9 +344,10 @@ void UdpProcess::onReadyRead() {
                 const auto* resp = reinterpret_cast<const DrcomMiscResponseInfo*>(data.constData());
                 DrcomPacket::decryptDrcom(resp->encrypted,
                                           m_decryptedInfo.data(), m_decryptedInfo.size());
-                log(LogLevel::Info, "解密信息: " +
-                    QByteArray(reinterpret_cast<const char*>(m_decryptedInfo.data()),
-                               static_cast<int>(m_decryptedInfo.size())).toHex());
+                if (m_debugLog.load())
+                    log(LogLevel::Info, "[调试] 解密信息: " +
+                        QByteArray(reinterpret_cast<const char*>(m_decryptedInfo.data()),
+                                   static_cast<int>(m_decryptedInfo.size())).toHex());
                 m_heartbeatTimer->start();
                 deferOnline();
                 sendAlive();

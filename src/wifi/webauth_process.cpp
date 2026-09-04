@@ -40,6 +40,17 @@ int makeV()
     return QRandomGenerator::global()->bounded(500, 10000);
 }
 
+// 登录响应判定枚举 → 可读名称（调试输出用）
+QString verdictName(PortalParser::Verdict v)
+{
+    switch (v) {
+    case PortalParser::Verdict::Success: return QStringLiteral("Success");
+    case PortalParser::Verdict::Failure: return QStringLiteral("Failure");
+    case PortalParser::Verdict::Unknown: return QStringLiteral("Unknown");
+    }
+    return QStringLiteral("?");
+}
+
 } // namespace
 
 // ============================================================================
@@ -66,6 +77,17 @@ void WebAuthProcess::setConfig(const AuthConfig& config)
 {
     QMutexLocker lock(&m_mutex);
     m_config = config;
+}
+
+void WebAuthProcess::setDebugLogEnabled(bool on)
+{
+    m_debugLog.store(on);
+}
+
+void WebAuthProcess::debugLog(const QString& message)
+{
+    if (m_debugLog.load())
+        deferLog(QStringLiteral("[调试] ") + message, 0);
 }
 
 // ============================================================================
@@ -170,6 +192,14 @@ void WebAuthProcess::start()
         m_pending.clear();
         m_confirmAttempts = 0;
         m_onlineNotified = false;   // 新会话：需重新宣告在线（避免跨轮询沿用旧标记）
+        m_probeIdx = 0;             // 校区域名候选探测：新会话清零
+        m_probeSawUsable = false;
+        m_domainConfirmed = false;
+        m_triedAlternate = false;
+        // 每次会话以默认域名为基址重来（跨校区重连不残留上轮发现的域名）；
+        // 正确域名由 302 / online_list 探测 / 失败换域 重新确定
+        m_portalOrigin = QStringLiteral("https://") + QLatin1String(EPORTAL_DEFAULT_HOST);
+        m_eportalPort = EPORTAL_HTTPS_PORT;
     }
 
     // 首次启动时在工作线程内创建网络管理器与定时器（线程亲和）
@@ -196,7 +226,7 @@ void WebAuthProcess::start()
         });
     }
 
-    emit logMessage(QStringLiteral("无线门户认证启动，正在探测在线状态..."), 0);
+    debugLog(QStringLiteral("无线门户认证启动，正在探测在线状态..."));
     beginCycle();
 }
 
@@ -263,7 +293,7 @@ void WebAuthProcess::sendUnbindRequest()
         // 实测网络即刻下线。不能用 error()==NoError 判定成功——请求尚在飞行中时
         // 那也是 NoError；以 HTTP 状态码判定。
         if (status == 200) {
-            deferLog(QStringLiteral("解绑/注销请求已发送（HTTP %1）").arg(status), 0);
+            debugLog(QStringLiteral("解绑/注销请求已发送（HTTP %1）").arg(status));
             deferLog(QStringLiteral("已注销（解绑下线，在线会话已回收）"), 0);
         } else {
             deferLog(errStr.isEmpty()
@@ -296,6 +326,10 @@ void WebAuthProcess::checkNow()
             return;
         ++m_startGeneration;   // 丢弃旧回调（含进行中的登录/确认）
         m_running = true;
+        m_probeIdx = 0;        // 校区域名候选探测：重探测也清零
+        m_probeSawUsable = false;
+        m_domainConfirmed = false;
+        m_triedAlternate = false;
     }
     teardown();
     beginCycle();
@@ -398,6 +432,7 @@ void WebAuthProcess::probeGateway()
         return;
     }
     m_gatewayIp = gw.toString();
+    debugLog(QStringLiteral("探测网关 %1").arg(m_gatewayIp));
 
     // ② 网关探测：未认证时网关 80 端口稳定返回 302 → 门户入口
     sendJsonpGet(QUrl(QStringLiteral("http://") + m_gatewayIp + QLatin1Char('/')), false, 6000,
@@ -406,13 +441,16 @@ void WebAuthProcess::probeGateway()
             return;
         // 302 Location 即门户入口（实测：https://s2.scut.edu.cn/a79.htm?wlanacip=…）
         if (!location.isEmpty()) {
+            debugLog(QStringLiteral("网关 302 重定向 → %1").arg(location));
             const QUrl entry(location);
             if (entry.isValid()) {
                 m_portalFetchRetries = 0;   // 新一轮门户发现：重置瞬态重试计数
+                m_domainConfirmed = true;   // AC 直指的门户 = 当前 zone 的可靠域名，无需再探测/换域
                 fetchPortalPage(entry);
                 return;
             }
         }
+        debugLog(QStringLiteral("网关无 302（body=%1 B，location 为空），用 online_list 确认在线状态").arg(body.size()));
         // 网关【无 302】（200/refused/空体）→ 不做任何"放行/在线"推断，一律交由
         // 门户 online_list 权威确认。仅当 Wi-Fi 明确未关联时才直接判"未连接"。
         if (!WlanMedia::currentWifiConnection().connected) {
@@ -432,43 +470,62 @@ void WebAuthProcess::queryOnlineStatus()
     if (staleGen(gen))
         return;
 
-    // 向门户查当前本机在线状态（online_list = 门户权威信息）：
-    //   result:1 且 list 含本机会话 → 已在线；其它 → 未在线（走登录）；
-    //   响应不可解析（网络错）→ 无法确认（明确失败，不推断）。
-    // 本机 IP/MAC 以运行期配置为权威（startWifiAuth 已从 Wi-Fi 接口写入）；
-    // v46ip 仅兜底——首轮探测时 m_vars 尚未解析（空），用之会带 ip=0 查询
-    const QUrl url = PortalParser::buildOnlineListUrl(
-        m_portalOrigin, m_eportalPort, wifiIpInt(), wifiMacHex(),
-        QLatin1String(EPORTAL_JS_VERSION), makeJsonpCallback(), makeV());
+    // 网关无 302（已认证放行 / 网关不指向门户）时，无法单靠 302 得知校区域名。
+    // 逐个用候选域名（EPORTAL_HOST_CANDIDATES）查 online_list —— 哪个返回 result:1 且
+    // 是本机会话，哪个就是当前 zone 的正确域名（对应"已在线门户显示已成功登录"现象）。
+    m_probeIdx = 0;
+    m_probeSawUsable = false;
+    probeCandidate(gen);
+}
 
-    sendJsonpGet(url, true, PORTAL_FETCH_TIMEOUT_MS, [this, gen](const QByteArray& body, const QString&) {
-        if (staleGen(gen))
-            return;
-        const QJsonObject json = PortalParser::extractJsonp(body);
-        const QJsonArray list = json.value(QStringLiteral("list")).toArray();
-        if (json.value(QStringLiteral("result")).toInt(-1) == 1 && !list.isEmpty()) {
-            // 归属校验：多端共享网关/同网段时列表可能仅含他机会话，不算本机在线。
-            // 在线的确认日志/Online 信号由 finishOnline 仅在首次上线时打印（防轮询刷屏）
-            if (PortalParser::isOwnSession(list.first().toObject(),
-                                           wifiIpString(), m_config.username, wifiMacHex())) {
-                finishOnline();
-                return;
-            }
-            deferLog(QStringLiteral("在线列表仅含其它设备会话，按未登录处理"), 1);
-        }
-        if (json.isEmpty()) {
-            // 无法解析（网络错/非 JSON）→ 无法向门户确认，明确失败（不猜测）
+void WebAuthProcess::probeCandidate(int gen)
+{
+    if (staleGen(gen))
+        return;
+
+    // 所有候选都探测完：
+    //   · 至少一个可达（有可解析响应）但无本机会话 → 未登录，走页面登录（基址用默认）；
+    //   · 全部无法解析（网络错）→ 无法确认，明确失败（不猜测）。
+    if (m_probeIdx >= static_cast<int>(EPORTAL_HOST_CANDIDATES.size())) {
+        if (m_probeSawUsable) {
+            debugLog(QStringLiteral("候选校区域名均未发现本机会话，按未登录处理"));
+            const QUrl entry(m_portalOrigin + QLatin1String(PORTAL_ENTRY_PATH) + m_gatewayIp);
+            fetchPortalPage(entry);
+        } else {
             deferLog(QStringLiteral("无法向门户确认在线状态（查询无响应）"), 1);
             deferState(WifiAuthState::Failed,
                        QStringLiteral("无法确认在线状态，请稍后重试"), true);
             flushPending();
+        }
+        return;
+    }
+
+    const QString origin = QStringLiteral("https://")
+                           + QLatin1String(EPORTAL_HOST_CANDIDATES[m_probeIdx]);
+    const QUrl url = PortalParser::buildOnlineListUrl(
+        origin, m_eportalPort, wifiIpInt(), wifiMacHex(),
+        QLatin1String(EPORTAL_JS_VERSION), makeJsonpCallback(), makeV());
+
+    sendJsonpGet(url, true, PORTAL_FETCH_TIMEOUT_MS, [this, gen, origin](const QByteArray& body, const QString&) {
+        if (staleGen(gen))
+            return;
+        const QJsonObject json = PortalParser::extractJsonp(body);
+        if (!json.isEmpty())
+            m_probeSawUsable = true;   // 至少一个候选可达（即便未登录）
+        const QJsonArray list = json.value(QStringLiteral("list")).toArray();
+        if (json.value(QStringLiteral("result")).toInt(-1) == 1 && !list.isEmpty()
+            && PortalParser::isOwnSession(list.first().toObject(),
+                                          wifiIpString(), m_config.username, wifiMacHex())) {
+            // 该候选门户"认识"本机会话 → 当前 zone 的正确域名
+            m_portalOrigin = origin;
+            m_domainConfirmed = true;
+            debugLog(QStringLiteral("online_list 命中校区域名 %1，认定当前 zone 在线").arg(origin));
+            finishOnline();
             return;
         }
-        // 门户明确了"无本机会话" → 未在线，进入认证流程。
-        // 入口页路径为模板常量（真实入口由 AC 302 动态下发，禁止硬编码入口 host）
-        deferLog(QStringLiteral("门户反馈当前未登录，进入认证流程"), 0);
-        const QUrl entry(m_portalOrigin + QLatin1String(PORTAL_ENTRY_PATH) + m_gatewayIp);
-        fetchPortalPage(entry);
+        // 本候选未命中 → 探测下一候选
+        ++m_probeIdx;
+        probeCandidate(gen);
     });
 }
 
@@ -479,7 +536,7 @@ void WebAuthProcess::fetchPortalPage(const QUrl& url)
         return;
 
     deferState(WifiAuthState::FetchingPortal);
-    deferLog(QStringLiteral("发现认证门户: ") + url.toString(), 0);
+    debugLog(QStringLiteral("发现认证门户: ") + url.toString());
     flushPending();
 
     // ④ 门户页：自签证书 → 仅此请求忽略校验。
@@ -517,9 +574,9 @@ void WebAuthProcess::fetchPortalRedirect(const QUrl& u, int depth)
         if (body.isEmpty()) {
             if (m_portalFetchRetries < 2) {
                 ++m_portalFetchRetries;
-                deferLog(QStringLiteral("门户页抓取失败，%1 秒后重试（%2/2）...")
+                debugLog(QStringLiteral("门户页抓取失败，%1 秒后重试（%2/2）...")
                              .arg(QString::number(WIFI_RETRY_DELAY_MS / 1000.0, 'f', 1))
-                             .arg(m_portalFetchRetries), 0);
+                             .arg(m_portalFetchRetries));
                 // 重新入 fetchPortalPage：重试时重新归一化 host/port（与旧行为一致，
                 // 同时刷新 origin——门户域在竞态重定向中已变化的情况）
                 QTimer::singleShot(WIFI_RETRY_DELAY_MS, this, [this, gen, u]() {
@@ -545,6 +602,10 @@ void WebAuthProcess::fetchPortalRedirect(const QUrl& u, int depth)
             flushPending();
             return;
         }
+        debugLog(QStringLiteral("门户解析 OK: 入口=%1 v4serip=%2 v46ip=%3 wlanacip=%4 端口=%5 登录字段=%6/%7 成功页=%8")
+                     .arg(u.toString(), m_vars.v4serip, m_vars.v46ip, m_vars.wlanacip,
+                          QString::number(m_vars.authLoginPort),
+                          m_vars.authUserField, m_vars.authPassField, m_vars.authSuccess));
         fetchLoadConfig();
     });
 }
@@ -568,6 +629,7 @@ void WebAuthProcess::fetchLoadConfig()
     q.addQueryItem(QStringLiteral("gw_id"),            QStringLiteral("000000000000"));
     q.addQueryItem(QStringLiteral("callback"),         makeJsonpCallback());
     url.setQuery(q);
+    debugLog(QStringLiteral("loadConfig 请求: %1").arg(url.toString()));
 
     sendJsonpGet(url, true, PORTAL_FETCH_TIMEOUT_MS, [this, gen](const QByteArray& body, const QString&) {
         if (staleGen(gen))
@@ -575,9 +637,9 @@ void WebAuthProcess::fetchLoadConfig()
         // 空体（网络抖/瞬断）→ 重试 2 次再采用默认值，抗多网卡 DNS/瞬时抖动
         if (body.isEmpty() && m_loadConfigRetries < 2) {
             ++m_loadConfigRetries;
-            deferLog(QStringLiteral("门户配置获取失败，%1 秒后重试（%2/2）...")
+            debugLog(QStringLiteral("门户配置获取失败，%1 秒后重试（%2/2）...")
                          .arg(QString::number(WIFI_RETRY_DELAY_MS / 1000.0, 'f', 1))
-                         .arg(m_loadConfigRetries), 0);
+                         .arg(m_loadConfigRetries));
             QTimer::singleShot(WIFI_RETRY_DELAY_MS, this, [this, gen]() {
                 if (!staleGen(gen))
                     fetchLoadConfig();
@@ -590,8 +652,8 @@ void WebAuthProcess::fetchLoadConfig()
         if (json.value(QStringLiteral("code")).toInt() == 1 && !data.isEmpty()) {
             m_loginMethod = data.value(QStringLiteral("login_method")).toString();
             m_enMd5       = data.value(QStringLiteral("en_md5")).toInt() == 1;
-            deferLog(QStringLiteral("门户配置: login_method=%1 en_md5=%2")
-                         .arg(m_loginMethod, QString::number(m_enMd5)), 0);
+            debugLog(QStringLiteral("门户配置: login_method=%1 en_md5=%2")
+                         .arg(m_loginMethod, QString::number(m_enMd5)));
         } else {
             // 配置接口异常（重试后仍不可用）：不强行造"默认登录方式"（实测会引入
             // login_method 不一致）；仅保持 login_method 为空→登录默认用 "1"，
@@ -609,7 +671,7 @@ void WebAuthProcess::sendLogin()
         return;
 
     deferState(WifiAuthState::LoggingIn);
-    deferLog(QStringLiteral("正在向门户提交账号..."), 0);
+    debugLog(QStringLiteral("正在向门户提交账号..."));
     flushPending();
 
     // 登录前先查在线：服务器对"已在线账号"的再登录会返回空体（实测），且多端
@@ -628,7 +690,7 @@ void WebAuthProcess::sendLogin()
                 && PortalParser::isOwnSession(list.first().toObject(),
                                               wifiIpString(), m_config.username, wifiMacHex())) {
                 // 账号已在线（本机会话命中）→ 无需重复登录
-                deferLog(QStringLiteral("检测到已处于在线状态，无需重复登录"), 0);
+                debugLog(QStringLiteral("检测到已处于在线状态，无需重复登录"));
                 finishOnline();
                 return;
             }
@@ -671,19 +733,34 @@ void WebAuthProcess::sendLoginBody()
     q.addQueryItem(QStringLiteral("v"),              QString::number(makeV()));
     url.setQuery(q);
 
+    // 调试：登录请求参数（【绝不】输出 user_password）
+    debugLog(QStringLiteral("登录请求: 端口=%1 login_method=%2 账号=%3 wlan_user_ip=%4 wlan_ac_ip=%5")
+                 .arg(QString::number(m_eportalPort),
+                      m_loginMethod.isEmpty() ? QStringLiteral("1") : m_loginMethod,
+                      m_config.username, m_vars.v46ip, m_vars.wlanacip));
+
     sendJsonpGet(url, /*ignoreTls=*/true, PORTAL_LOGIN_TIMEOUT_MS,
                  [this, gen](const QByteArray& body, const QString&) {
         if (staleGen(gen))
             return;
         const PortalParser::VerdictResult r = PortalParser::classify(body);
+        debugLog(QStringLiteral("登录响应判定: verdict=%1 retryable=%2 msg=%3")
+                     .arg(verdictName(r.verdict), QString::number(r.retryable), r.message));
         switch (r.verdict) {
         case PortalParser::Verdict::Success:
             m_confirmAttempts = 0;
             confirmOnline();
             return;
         case PortalParser::Verdict::Failure:
-            deferLog(QStringLiteral("门户认证失败: %1").arg(r.message.isEmpty()
-                                                             ? QStringLiteral("未知错误") : r.message), 2);
+            // 默认(未证实)域名登录失败且可重试（如错区"Radius超时"等暂时性现象）→
+            // 换另一候选校区域名重来一次，以免"校区不同登不上"被误报为登录失败。
+            // 已证实域名(302/探测命中)或硬性错误(凭证/账户)不换，直接按失败处理。
+            if (r.retryable && !m_domainConfirmed && !m_triedAlternate) {
+                tryAlternateDomain();
+                return;
+            }
+            // 失败仅由 deferState 携带 message 输出一次（SessionManager 会显示该文案），
+            // 不再额外 deferLog 同一句，避免"门户认证失败: X"与"X"重复刷屏。
             deferState(WifiAuthState::Failed,
                        r.message.isEmpty() ? QStringLiteral("无线认证失败") : r.message, r.retryable);
             flushPending();
@@ -695,6 +772,37 @@ void WebAuthProcess::sendLoginBody()
         deferState(WifiAuthState::Failed, QStringLiteral("门户登录响应异常，请稍后重试"), true);
         flushPending();
     });
+}
+
+void WebAuthProcess::tryAlternateDomain()
+{
+    const int gen = m_startGeneration;
+    if (staleGen(gen))
+        return;
+
+    // 换当前 host 之外的另一候选校区域名（共两个，取不同者）。m_triedAlternate 保证至多重来一次。
+    const QString currentHost = QUrl(m_portalOrigin).host();
+    QString altHost;
+    for (const char* c : EPORTAL_HOST_CANDIDATES) {
+        if (QLatin1String(c) != currentHost) {
+            altHost = QString::fromLatin1(c);
+            break;
+        }
+    }
+    if (altHost.isEmpty()) {
+        // 没有另一候选（或已换过）→ 按失败处理
+        deferState(WifiAuthState::Failed, QStringLiteral("认证失败"), true);
+        flushPending();
+        return;
+    }
+
+    m_triedAlternate = true;
+    m_portalOrigin = QStringLiteral("https://") + altHost;
+    debugLog(QStringLiteral("域名登录失败，切换候选校区域名 %1 重试").arg(m_portalOrigin));
+    // 重新抓取该域名的门户页 → parse → loadConfig → login。此处【不】置 m_domainConfirmed：
+    // 若该域也失败且可重试，因 m_triedAlternate 已置位而不再换，回归正常失败处理。
+    const QUrl entry(m_portalOrigin + QLatin1String(PORTAL_ENTRY_PATH) + m_gatewayIp);
+    fetchPortalPage(entry);
 }
 
 void WebAuthProcess::confirmOnline()
@@ -716,24 +824,26 @@ void WebAuthProcess::confirmOnline()
         const QJsonObject json = PortalParser::extractJsonp(body);
         const int result = json.value(QStringLiteral("result")).toInt(-1);
         const QJsonArray list = json.value(QStringLiteral("list")).toArray();
+        debugLog(QStringLiteral("online_list 查询: result=%1 会话数=%2 尝试=%3")
+                     .arg(result).arg(list.size()).arg(m_confirmAttempts));
         if ((result == 1) && !list.isEmpty()) {
             const QJsonObject session = list.first().toObject();
             // 归属校验：列表非空但非本机会话（多端共享网关/同网段）→ 视为未放行，继续轮询
             if (PortalParser::isOwnSession(session,
                                            wifiIpString(), m_config.username, wifiMacHex())) {
-                deferLog(QStringLiteral("门户确认上线（会话 %1，账号 %2）")
+                debugLog(QStringLiteral("门户确认上线（会话 %1，账号 %2）")
                              .arg(session.value(QStringLiteral("online_session")).toInt())
-                             .arg(session.value(QStringLiteral("user_account")).toString()), 0);
+                             .arg(session.value(QStringLiteral("user_account")).toString()));
                 finishOnline();
                 return;
             }
-            deferLog(QStringLiteral("在线列表仅含其它设备会话，继续等待..."), 1);
+            debugLog(QStringLiteral("在线列表仅含其它设备会话，继续等待..."));
         }
         ++m_confirmAttempts;
         if (m_confirmAttempts < WIFI_CONFIRM_TIMEOUT_MS / WIFI_CONFIRM_POLL_MS) {
-            deferLog(QStringLiteral("等待上线确认（%1/%2）...")
+            debugLog(QStringLiteral("等待上线确认（%1/%2）...")
                          .arg(m_confirmAttempts)
-                         .arg(WIFI_CONFIRM_TIMEOUT_MS / WIFI_CONFIRM_POLL_MS), 0);
+                         .arg(WIFI_CONFIRM_TIMEOUT_MS / WIFI_CONFIRM_POLL_MS));
             m_confirmTimer->start(WIFI_CONFIRM_POLL_MS);
             return;
         }
@@ -756,8 +866,9 @@ void WebAuthProcess::finishOnline()
     // 在线时静默续跑（只重启轮询），避免每轮重复打印"确认在线/已认证"刷屏
     if (!m_onlineNotified) {
         m_onlineNotified = true;
-        deferLog(QStringLiteral("门户确认当前在线"), 0);
-        deferState(WifiAuthState::Online, QStringLiteral("无线校园网已认证"));
+        // 上线即一条清晰的成功文案（与有线 onEapSuccess 的"认证成功，可以上网了！"一致）；
+        // 具体会话/账号细节走调试日志（debugLog），不污染用户视线。
+        deferState(WifiAuthState::Online, QStringLiteral("认证成功，可以上网了！"));
         deferOnline();
         flushPending();
     }

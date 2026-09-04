@@ -5,6 +5,7 @@
 #include <QMutex>
 #include <QObject>
 #include <QString>
+#include <atomic>
 #include "core/constants.h"
 #include "core/deferred_signals.h"
 #include "core/protocol.h"
@@ -52,6 +53,8 @@ public:
 
     // 同步直调：先于排队的 start() 执行，保证工作线程看到最新配置（与 EAP/UDP 契约一致）
     void setConfig(const AuthConfig& config);
+    // 调试输出开关：开启后输出无线 Portal 各阶段（探测/解析/login/确认）追踪
+    void setDebugLogEnabled(bool on);
 
 public slots:
     void start();
@@ -80,7 +83,9 @@ private:
     // --- 状态机阶段 ---
     void beginCycle();                    // 入口：probe ① 网关 302 探测（唯一可信、绑 Wi-Fi）
     void probeGateway();                  // ① 网关探测：302→门户；无 302/异常→查门户在线状态
-    void queryOnlineStatus();             // ①(b) 向门户查当前登录状态（online_list，若已缓存门户）
+    void queryOnlineStatus();             // ①(b) 无 302：逐个候选域名用 online_list 探测"哪个认识本机会话"，确定当前 zone 域名
+    void probeCandidate(int gen);         // ①(b) 探测当前候选校区域名的 online_list（链式推进，见 queryOnlineStatus）
+    void tryAlternateDomain();            // 默认域名登录失败且可重试时，换另一候选域名重来（防"错区登不上"）
     void fetchPortalPage(const QUrl& url);// ② 抓取门户页 → 解析
     void fetchPortalRedirect(const QUrl& url, int depth); // ② 手动跟随门户重定向链（成员函数重入，避免递归 std::function 自捕获悬垂）
     void fetchLoadConfig();               // ⑤ 动态配置（page_index/en_md5/login_method）
@@ -112,6 +117,7 @@ private:
     DeferredSignalQueue<PendingSignal> m_pending;               // 持锁缓冲、解锁后 flush
     int  m_startGeneration = 0;
     bool m_running = false;
+    std::atomic<bool> m_debugLog{false};                        // 调试输出（Portal 阶段追踪）
 
     QNetworkAccessManager* m_nam = nullptr;                     // 工作线程内懒创建
     QTimer* m_pollTimer    = nullptr;                           // 在线期轮询（60s）
@@ -127,6 +133,11 @@ private:
     int     m_confirmAttempts = 0;    // 上线确认已尝试次数
     int     m_portalFetchRetries = 0; // 门户页抓取瞬态失败重试计数
     int     m_loadConfigRetries = 0;  // loadConfig 瞬态失败重试计数
+    // —— 校区域名候选探测（多校区；无 302 时用 online_list 选"认识当前会话"的域名） ——
+    int  m_probeIdx = 0;              // 当前探测到第几个候选域名
+    bool m_probeSawUsable = false;    // 本次探测是否有候选给出可解析的 online_list 响应
+    bool m_domainConfirmed = false;   // 当前 m_portalOrigin 是否已被证实（302 或 online_list 命中）
+    bool m_triedAlternate = false;    // 是否已换过校区域名重试（防无限循环）
     // 本次会话是否已向上层宣告"在线"（首次上线才打印确认日志/发 Online 信号；
     // 60 秒在线轮询命中在线时静默续跑，避免重复刷屏）
     bool    m_onlineNotified = false;
@@ -137,6 +148,9 @@ private:
     void deferLog(const QString& msg, int level = 0);
     void deferOnline();
     void flushPending();
+
+    // 调试输出：仅 m_debugLog 时以 [调试] 前缀缓冲到信号队列（与 deferLog 同型）
+    void debugLog(const QString& message);
 };
 
 #endif // WEBAUTH_PROCESS_H

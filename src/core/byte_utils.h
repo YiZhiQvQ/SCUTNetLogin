@@ -2,6 +2,7 @@
 #define BYTE_UTILS_H
 
 #include <QString>
+#include <QByteArray>
 #include <QHostAddress>
 #include <cstdint>
 
@@ -25,6 +26,10 @@ bool isIpZero(const uint8_t* ip);
 
 // MAC 地址标准化：去分隔符（':' / '-' / '.'）、转大写；非法格式返回空字符串
 QString normalizeMac(const QString& mac);
+
+// 帧/包十六进制转储：每字节两位大写十六进制，以空格分隔；超过 maxBytes 时截断并
+// 标注总长。纯格式化，供调试输出（EAP/UDP 帧级 hex）复用。maxBytes<=0 表示不截断。
+QString hexDump(const QByteArray& data, int maxBytes = 96);
 
 } // namespace ByteUtils
 

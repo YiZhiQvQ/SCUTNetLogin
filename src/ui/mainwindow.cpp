@@ -147,18 +147,40 @@ MainWindow::MainWindow(QWidget* parent)
     ui->comboInterface->setMinimumContentsLength(10);
 
     initSessionManager();
+    // 调试输出：勾选立即生效（运行时开关，无需重启）；配置值随后在 loadConfig 恢复，
+    // 并随"保存配置"落盘持久化
+    connect(ui->checkDebugLog, &QCheckBox::toggled, this, [this](bool on) {
+        if (m_sessionManager)
+            m_sessionManager->setDebugLogEnabled(on);
+    });
     loadInterfaces();
     loadConfig();
     autoDetectNetworkConfig();
     initSystemTray(appIcon);
+
+    // 调试：启用的连接尝试基线（模式恒为自动；SSID 白名单/选中网卡/自动检测 IP 与 MAC）——
+    // 供跨机器对照"这台启动时到底把网卡识别成什么"
+    if (ui->checkDebugLog->isChecked()) {
+        onLogMessage(QStringLiteral("[调试] 配置加载: 联网方式=自动, SSID白名单=%1, 选中网卡=%2, "
+                                    "自动检测IP=%3 / MAC=%4")
+                         .arg(ui->editSsid->text().trimmed(),
+                              ui->comboInterface->currentText(),
+                              ui->editIp->text(),
+                              ui->editMac->text()), 0);
+    }
 
     updateConnectModeLabel(AppConnectionState::Disconnected);   // 初始"当前连接模式：未连接"
 
     // 窗口几何记忆（注册表存储，独立于 config.ini 认证配置）
     QSettings uiSettings;
     const QByteArray geometry = uiSettings.value(QStringLiteral("ui/windowGeometry")).toByteArray();
-    if (!geometry.isEmpty())
+    if (!geometry.isEmpty()) {
         restoreGeometry(geometry);
+        // 用户要求：启动时不要最大化。closeEvent 的 saveGeometry() 会把"上次是否最大化"
+        // 一并存进 ui/windowGeometry，若上次最大化后关到托盘，下次会还原成最大化——故剥掉。
+        if (windowState() & Qt::WindowMaximized)
+            setWindowState(windowState() & ~Qt::WindowMaximized);
+    }
 
     // Ctrl+Enter（主键盘/小键盘）快捷连接
     auto* connectShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_Return), this);
@@ -432,6 +454,10 @@ void MainWindow::loadConfig()
     ui->checkAutoStart->setChecked(cfg.autoStart);
     ui->checkAutoConnect->setChecked(cfg.autoConnect);
     ui->checkLogoutOnExit->setChecked(cfg.logoutOnExit);
+    // 调试输出：恢复勾选并立即生效（setChecked 会触发 toggled → setDebugLogEnabled，
+    // 此处显式调用保证值同步到 SessionManager；幂等无副作用）
+    ui->checkDebugLog->setChecked(cfg.debugLog);
+    m_sessionManager->setDebugLogEnabled(cfg.debugLog);
 
     // 无线 SSID 白名单（联网方式控件已移除，mode 恒为"自动"——config 键仅兼容保留）
     ui->editSsid->setText(cfg.wifiSsids);
@@ -467,6 +493,7 @@ AppConfig MainWindow::collectCurrentCfg()
     cfg.autoConnect    = ui->checkAutoConnect->isChecked();
     cfg.wifiSsids      = ui->editSsid->text().trimmed();
     cfg.logoutOnExit   = ui->checkLogoutOnExit->isChecked();
+    cfg.debugLog       = ui->checkDebugLog->isChecked();
     // cfg.connectMode 不再写入：模式切换功能已移除，恒为"自动"（键仅向后兼容保留）
     return cfg;
 }

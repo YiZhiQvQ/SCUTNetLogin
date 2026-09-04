@@ -106,6 +106,9 @@ private slots:
     void normalizeMac_formats();
     void normalizeMac_invalidHex();
     void isZero_checks();
+    void hexDump_empty();
+    void hexDump_basic();
+    void hexDump_truncation();
 
     // ---------- EapolPacket ----------
     void buildEapolFrame_sizesAndHeader();
@@ -207,6 +210,29 @@ void TestPackets::isZero_checks()
     uint8_t ipNonZero[4] = { 0, 0, 0, 1 };
     QVERIFY(ByteUtils::isIpZero(ipZero));
     QVERIFY(!ByteUtils::isIpZero(ipNonZero));
+}
+
+void TestPackets::hexDump_empty()
+{
+    QCOMPARE(ByteUtils::hexDump(QByteArray()), QStringLiteral("(0 B)"));
+}
+
+void TestPackets::hexDump_basic()
+{
+    const QByteArray data = QByteArray::fromHex("0102030aff");
+    QCOMPARE(ByteUtils::hexDump(data), QStringLiteral("01 02 03 0A FF (5 B)"));
+}
+
+void TestPackets::hexDump_truncation()
+{
+    const QByteArray data(200, 0xAB);
+    const QString s = ByteUtils::hexDump(data, 4);
+    QVERIFY(s.startsWith(QStringLiteral("AB AB AB AB")));
+    QVERIFY(s.contains(QStringLiteral("共 200 B")));
+    QVERIFY(s.contains(QStringLiteral("显示前 4 B")));
+
+    // maxBytes<=0 = 不截断
+    QVERIFY(ByteUtils::hexDump(data, 0).contains(QStringLiteral("(200 B)")));
 }
 
 // ============================================================================
@@ -846,6 +872,7 @@ void TestPackets::configManager_roundtrip()
     cfg.connectMode    = QStringLiteral("wireless");
     cfg.wifiSsids      = QStringLiteral("scut-student,SCUT-5G\345\256\277");   // 含全角顿号
     cfg.logoutOnExit   = true;
+    cfg.debugLog       = true;
 
     ConfigManager::save(path, cfg);
 
@@ -867,6 +894,7 @@ void TestPackets::configManager_roundtrip()
     QCOMPARE(loaded.connectMode, cfg.connectMode);
     QCOMPARE(loaded.wifiSsids,   cfg.wifiSsids);
     QVERIFY(loaded.logoutOnExit);
+    QVERIFY(loaded.debugLog);
 
     // 清理工作目录（失败时忽略，不影响断言结果）
     QDir(workDir).removeRecursively();

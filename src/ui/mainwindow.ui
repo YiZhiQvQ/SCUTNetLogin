@@ -508,6 +508,12 @@
                  <property name="text"><string>启动后自动连接</string></property>
                 </widget>
                </item>
+               <item>
+                <widget class="QCheckBox" name="checkDebugLog">
+                 <property name="text"><string>启用调试输出（详细连接决策/网卡枚举/帧级hex）</string></property>
+                 <property name="toolTip"><string>勾选后在运行日志输出网卡枚举、后端决策依据、EAP/UDP 帧级十六进制与无线门户各阶段参数，便于跨机器排查「一直连有线」等问题。密码绝不会出现在日志中。</string></property>
+                </widget>
+               </item>
               </layout>
              </widget>
             </item>

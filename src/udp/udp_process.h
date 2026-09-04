@@ -19,6 +19,8 @@ public:
     ~UdpProcess() override;
     void setConfig(const AuthConfig& config);
     void setMd5Data(const QByteArray& md5Data);
+    // 调试输出开关：开启后收发 DrCOM UDP 包输出原始 hex（worker 线程原子自读）
+    void setDebugLogEnabled(bool on);
 
 public slots:
     void start();
@@ -74,6 +76,7 @@ private:
     QTimer* m_heartbeatTimer = nullptr;
     QTimer* m_timeoutTimer = nullptr;
     std::atomic<bool> m_running{false};
+    std::atomic<bool> m_debugLog{false};   // 调试输出（帧级 hex）
     uint8_t m_counter = 0;
     int     m_startGeneration = 0;      // start() 代数：使过期的 DNS 回调失效
     int     m_miscInfoRetryCount = 0;   // MiscInfo 发送失败重试计数（见 sendMiscInfo）

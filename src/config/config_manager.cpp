@@ -38,6 +38,7 @@ AppConfig load(const QString& configPath)
     cfg.connectMode    = settings.value("connectMode", QString::fromLatin1(PORTAL_DEFAULT_MODE)).toString();
     cfg.wifiSsids      = settings.value("wifiSsids",  QString::fromLatin1(PORTAL_DEFAULT_SSID)).toString();
     cfg.logoutOnExit   = settings.value("logoutOnExit", false).toBool();
+    cfg.debugLog       = settings.value("debugLog", false).toBool();
 
     // 密码：优先按 DPAPI 密文解密；失败（非 DPAPI 密文（Base64 明文）/ 数据损坏 /
     // 非当前用户加密）则回退为直接 Base64 解码，兼容旧明文凭据。
@@ -73,6 +74,7 @@ void save(const QString& configPath, const AppConfig& cfg)
     settings.setValue("connectMode",    cfg.connectMode);
     settings.setValue("wifiSsids",      cfg.wifiSsids);
     settings.setValue("logoutOnExit",   cfg.logoutOnExit);
+    settings.setValue("debugLog",       cfg.debugLog);
 
     if (cfg.savePassword)
         settings.setValue("password", Credential::encryptPassword(cfg.password));

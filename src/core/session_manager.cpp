@@ -1,6 +1,7 @@
 #include "core/session_manager.h"
 #include "core/byte_utils.h"
 #include "core/constants.h"
+#include "config/config_manager.h"
 #include "network/network.h"
 #include "wifi/wlan_media.h"
 #include "log/log_manager.h"
@@ -92,7 +93,9 @@ void SessionManager::initProcesses()
     connect(&m_udpThread, &QThread::finished, m_udpProcess, &QObject::deleteLater);
     connect(m_udpProcess, &UdpProcess::logMessage, this, &SessionManager::logMessage);
     connect(m_udpProcess, &UdpProcess::stateChanged, this, [this](const QString& state, const QString& msg) {
-        emit logMessage(msg.isEmpty() ? state : state + QStringLiteral(": ") + msg, 0);
+        // "运行中: 正在解析服务器地址..." 属启动过程细节，仅调试时输出
+        if (m_debugLog)
+            emit logMessage(QStringLiteral("[调试] ") + (msg.isEmpty() ? state : state + QStringLiteral(": ") + msg), 0);
     });
     connect(m_udpProcess, &UdpProcess::online, this, &SessionManager::onUdpOnline);
     // EAP / UDP 线程【惰性启动】——在首次 startAuth() 时才拉起，程序仅开托盘不连接时不
@@ -146,6 +149,10 @@ void SessionManager::startConnection(const AuthConfig& config, const StaticIpCon
     m_ssidWhitelist = allowedSsids;
     m_wiredFailStreak = 0;    // 用户主动发起：有线失败计数清零（auto 回退语义从零开始）
     m_autoWaitEnabled = true; // 用户手动连接：恢复自动就绪重连
+
+    // 调试：每次连接尝试输出一次完整网卡枚举（直击"为什么判定有线"）
+    if (m_debugLog)
+        logAdapterDump(Network::dumpAdapters());
 
     // 后端决策（纯函数；auto 模式有线优先，无线仅当 SSID 命中白名单）
     const auto decision = decideBackend();
@@ -277,13 +284,32 @@ void SessionManager::startWifiAuth()
     QMetaObject::invokeMethod(m_webAuthProcess, "start", Qt::QueuedConnection);
 }
 
-ConnectionBuilder::BackendDecision SessionManager::decideBackend() const
+ConnectionBuilder::BackendDecision SessionManager::decideBackend()
 {
-    return ConnectionBuilder::resolveAuthBackend(
-        m_connectMode,
-        Network::ethernetLinkUp(),
-        WlanMedia::currentWifiConnection().ssid,
-        m_ssidWhitelist);
+    const bool        ethUp = Network::ethernetLinkUp();
+    const QString     ssid  = WlanMedia::currentWifiConnection().ssid;
+    const auto        decision = ConnectionBuilder::resolveAuthBackend(
+        m_connectMode, ethUp, ssid, m_ssidWhitelist);
+
+    if (m_debugLog) {
+        auto backendName = [](ConnectionBuilder::AuthBackend b) {
+            switch (b) {
+            case ConnectionBuilder::AuthBackend::WiredEap:   return QStringLiteral("有线 802.1X");
+            case ConnectionBuilder::AuthBackend::PortalWifi: return QStringLiteral("无线 Portal");
+            default:                                          return QStringLiteral("None");
+            }
+        };
+        debugLog(QStringLiteral("后端决策: 模式=%1, 有线链路=%2, 当前SSID=%3, 白名单=[%4] → 后端=%5%6")
+                     .arg(ConfigManager::connectModeToString(m_connectMode),
+                          ethUp ? QStringLiteral("Up") : QStringLiteral("Down"),
+                          ssid.isEmpty() ? QStringLiteral("(无)") : ssid,
+                          m_ssidWhitelist.join(QStringLiteral(", ")),
+                          backendName(decision.backend),
+                          decision.reason.isEmpty()
+                              ? QString()
+                              : QStringLiteral("（%1）").arg(decision.reason)));
+    }
+    return decision;
 }
 
 bool SessionManager::isWifiUiLive() const
@@ -415,6 +441,33 @@ void SessionManager::setAutoStart(bool enable)
 {
     QMetaObject::invokeMethod(m_networkWorker, "doSetAutoStart", Qt::QueuedConnection,
                               Q_ARG(bool, enable));
+}
+
+void SessionManager::setDebugLogEnabled(bool on)
+{
+    m_debugLog = on;
+    // 转发给三个工作进程：各自输出帧级/阶段级追踪（worker 线程用原子标志自读）
+    m_eapProcess->setDebugLogEnabled(on);
+    m_udpProcess->setDebugLogEnabled(on);
+    m_webAuthProcess->setDebugLogEnabled(on);
+}
+
+void SessionManager::debugLog(const QString& message)
+{
+    if (m_debugLog)
+        emit logMessage(QStringLiteral("[调试] ") + message, 0);
+}
+
+void SessionManager::logAdapterDump(const QString& dump)
+{
+    if (!m_debugLog)
+        return;
+    // dumpAdapters 返回多行文本：逐行单独发射，UI 与当日日志各获一行（可读/可检索）
+    const QStringList lines = dump.split(QLatin1Char('\n'));
+    for (const QString& line : lines) {
+        if (!line.trimmed().isEmpty())
+            debugLog(line);
+    }
 }
 
 // ============================================================================
@@ -638,6 +691,11 @@ void SessionManager::onAutoWaitTick()
         stopAutoWait();
         m_activeBackend = ActiveBackend::WiredEap;   // 同步后端：isWifiUiLive/链路监视等依赖它
         emit logMessage(QStringLiteral("检测到有线网卡已接入，自动开始有线认证..."), 0);
+        // 调试直击"为什么自动选了有线"：此刻把网卡枚举打出来
+        if (m_debugLog) {
+            logAdapterDump(Network::dumpAdapters());
+            debugLog(QStringLiteral("自动就绪监听：有线链路 Up → 选有线"));
+        }
         startWiredBackend();
         return;
     }
@@ -649,6 +707,8 @@ void SessionManager::onAutoWaitTick()
         stopAutoWait();
         m_activeBackend = ActiveBackend::PortalWifi;   // 同步后端：否则 Online 被 isWifiUiLive 丢弃，UI 停在"正在认证"
         emit logMessage(QStringLiteral("检测到校园 Wi-Fi（%1），自动开始无线认证...").arg(wlan.ssid), 0);
+        if (m_debugLog)
+            debugLog(QStringLiteral("自动就绪监听：无线命中（SSID=%1）→ 选无线").arg(wlan.ssid));
         startWifiAuth();
         return;
     }
@@ -790,6 +850,8 @@ void SessionManager::onReconnectTimeout()
                 && m_connectMode == ConnectMode::Auto
                 && m_wiredFailStreak >= 2) {
                 const WlanMedia::WlanInfo wlan = WlanMedia::currentWifiConnection();
+                if (m_debugLog)
+                    debugLog(QStringLiteral("重连复判：有线失败次数=%1（≥2），准备回退无线").arg(m_wiredFailStreak));
                 if (wlan.connected
                     && ConnectionBuilder::ssidMatch(wlan.ssid, m_ssidWhitelist)) {
                     emit logMessage(QStringLiteral("有线连续认证失败，自动回退无线认证..."), 1);

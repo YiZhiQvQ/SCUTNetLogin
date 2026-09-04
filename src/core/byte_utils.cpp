@@ -55,4 +55,27 @@ QString normalizeMac(const QString& mac)
     return hex.toUpper();
 }
 
+QString hexDump(const QByteArray& data, int maxBytes)
+{
+    const int n = data.size();
+    if (n == 0)
+        return QStringLiteral("(0 B)");
+
+    const bool truncate = (maxBytes > 0 && n > maxBytes);
+    const int shown = truncate ? maxBytes : n;
+
+    const QByteArray hex = data.left(shown).toHex().toUpper();
+    QString out;
+    for (int i = 0; i < hex.size(); i += 2) {
+        if (!out.isEmpty())
+            out += QLatin1Char(' ');
+        out += QLatin1Char(hex.at(i));
+        out += QLatin1Char(hex.at(i + 1));
+    }
+
+    out += truncate ? QStringLiteral(" ... (共 %1 B，显示前 %2 B)").arg(n).arg(shown)
+                    : QStringLiteral(" (%1 B)").arg(n);
+    return out;
+}
+
 } // namespace ByteUtils

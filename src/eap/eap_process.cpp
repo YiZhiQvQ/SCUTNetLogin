@@ -1,11 +1,59 @@
 #include "eap/eap_process.h"
 #include "core/constants.h"
+#include "core/byte_utils.h"
 #include "eap/eapol_packet.h"
 #include "eap/notification_parser.h"
 #include <QThread>
 #include <QDebug>
 #include <pcap.h>
 #include <winsock2.h>
+
+namespace {
+
+// 从帧字节解码一个可读的 EAPOL/EAP 帧标签（调试输出用）。
+// 帧布局：Eth(14) + EAPOL(version@14, type@15) [+ EAP(code@18, ... type@22)]
+QString frameLabel(const QByteArray& frame)
+{
+    if (frame.size() < 16)
+        return QStringLiteral("EAPOL?(截断)");
+    const quint8 eapolType = static_cast<quint8>(frame.at(15));
+    switch (eapolType) {
+    case EAPOL_TYPE_EAPOL_START:  return QStringLiteral("EAPOL-Start");
+    case EAPOL_TYPE_EAPOL_LOGOFF: return QStringLiteral("EAPOL-Logoff");
+    case EAPOL_TYPE_EAP_PACKET:
+        break;   // EAP-Packet：继续解码 EAP code/type
+    default:
+        return QStringLiteral("EAPOL(type=0x%1)").arg(eapolType, 2, 16, QLatin1Char('0')).toUpper();
+    }
+
+    if (frame.size() < EAP_HEADER_OFFSET + 1)
+        return QStringLiteral("EAP-Packet?(截断)");
+    const quint8 code = static_cast<quint8>(frame.at(EAP_HEADER_OFFSET));
+
+    auto typeName = [&]() -> QString {
+        if (frame.size() < EAP_PAYLOAD_OFFSET)
+            return QStringLiteral("?");
+        switch (static_cast<quint8>(frame.at(EAP_HEADER_OFFSET + 4))) {
+        case EAP_TYPE_IDENTITY:      return QStringLiteral("Identity");
+        case EAP_TYPE_NOTIFICATION:  return QStringLiteral("Notification");
+        case EAP_TYPE_MD5_CHALLENGE: return QStringLiteral("MD5-Challenge");
+        default:                     return QStringLiteral("type=0x%1")
+                                             .arg(static_cast<quint8>(frame.at(EAP_HEADER_OFFSET + 4)),
+                                                  2, 16, QLatin1Char('0')).toUpper();
+        }
+    };
+
+    switch (code) {
+    case EAP_CODE_REQUEST:  return QStringLiteral("EAP-Request(%1)").arg(typeName());
+    case EAP_CODE_RESPONSE: return QStringLiteral("EAP-Response(%1)").arg(typeName());
+    case EAP_CODE_SUCCESS:  return QStringLiteral("EAP-Success");
+    case EAP_CODE_FAILURE:  return QStringLiteral("EAP-Failure");
+    default:                 return QStringLiteral("EAP-Packet(code=0x%1)")
+                                 .arg(code, 2, 16, QLatin1Char('0')).toUpper();
+    }
+}
+
+} // namespace
 
 // ============================================================================
 // 构造 / 析构
@@ -36,6 +84,11 @@ void EapProcess::setConfig(AuthConfig config)
 {
     QMutexLocker locker(&m_mutex);
     m_config = std::move(config);
+}
+
+void EapProcess::setDebugLogEnabled(bool on)
+{
+    m_debugLog.store(on);
 }
 
 void EapProcess::log(LogLevel level, const QString& msg)
@@ -123,6 +176,11 @@ bool EapProcess::sendPacket(const uint8_t* data, size_t len)
 {
     if (!m_handle)
         return false;
+    if (m_debugLog.load()) {
+        const QByteArray frame(reinterpret_cast<const char*>(data), static_cast<int>(len));
+        log(LogLevel::Info, QStringLiteral("[调试][EAP 发] %1 %2")
+                                .arg(frameLabel(frame), ByteUtils::hexDump(frame)));
+    }
     return pcap_sendpacket(m_handle, data, static_cast<int>(len)) == 0;
 }
 
@@ -389,6 +447,11 @@ bool EapProcess::processEapPacket(const QByteArray& packet)
     if (packet.size() < ETH_HEADER_SIZE)
         return true;
 
+    if (m_debugLog.load()) {
+        log(LogLevel::Info, QStringLiteral("[调试][EAP 收] %1 %2")
+                                .arg(frameLabel(packet), ByteUtils::hexDump(packet)));
+    }
+
     const EthHeader* eth = reinterpret_cast<const EthHeader*>(packet.data());
 
     // 握手过程中嗅探交换机 MAC（后续单播用）
@@ -409,9 +472,11 @@ bool EapProcess::processEapPacket(const QByteArray& packet)
         handleEapRequest(eapHeader, payload);
     } else if (eapHeader.code == EAP_CODE_SUCCESS) {
         if (m_currentState != AuthState::Authenticated) {
-            log(LogLevel::Info, QStringLiteral("802.1X 认证成功！保持后台监听心跳..."));
+            if (m_debugLog.load())
+                log(LogLevel::Info, QStringLiteral("[调试] 802.1X 认证成功！保持后台监听心跳..."));
             m_currentState = AuthState::Authenticated;
-            deferState(AuthState::Authenticated, QStringLiteral("认证成功"));
+            // 上线成功由 onEapSuccess 统一输出"认证成功，可以上网了！"，状态消息留空防重复
+            deferState(AuthState::Authenticated, QString());
             deferEapSuccess(m_md5Result);
         }
     } else if (eapHeader.code == EAP_CODE_FAILURE) {
@@ -433,7 +498,8 @@ void EapProcess::handleEapRequest(const EAPHeader& hdr, const QByteArray& payloa
     switch (hdr.type) {
     case EAP_TYPE_IDENTITY: {
         if (m_currentState != AuthState::Authenticated) {
-            log(LogLevel::Info, QStringLiteral("收到 Identity 请求，正在回应..."));
+            if (m_debugLog.load())
+                log(LogLevel::Info, QStringLiteral("[调试] 收到 Identity 请求，正在回应..."));
             m_currentState = AuthState::SendingIdentity;
         }
         // 已认证状态下也静默回应（心跳检测），不写日志避免刷屏
@@ -443,7 +509,8 @@ void EapProcess::handleEapRequest(const EAPHeader& hdr, const QByteArray& payloa
     }
     case EAP_TYPE_MD5_CHALLENGE: {
         if (m_currentState != AuthState::Authenticated) {
-            log(LogLevel::Info, QStringLiteral("收到 MD5 挑战，计算回应..."));
+            if (m_debugLog.load())
+                log(LogLevel::Info, QStringLiteral("[调试] 收到 MD5 挑战，计算回应..."));
             m_currentState = AuthState::SendingMD5Challenge;
         }
         if (payload.size() > 1) {

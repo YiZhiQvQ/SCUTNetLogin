@@ -34,7 +34,11 @@ struct RawWin32Adapter {
 };
 
 // 虚拟/干扰适配器排除关键词（有线链路检测；USB 手机共享、虚拟机、蓝牙等不算
-// "物理有线网口"，避免 auto 模式被 USB 共享网卡误导为"网线已插入"）
+// "物理有线网口"，避免 auto 模式被 USB 共享网卡误导为"网线已插入"）。
+// VPN/隧道虚拟网卡（Radmin、WireGuard、Tailscale、ZeroTier、OpenVPN 等）在
+// Windows 下常以 ifType=Ethernet(6) + oper=Up 出现、即使未连任何 VPN——若不排除，
+// 会被误判为"物理有线已接入"，导致 auto 模式恒选有线（实测 Radmin VPN 触发的
+// "一直默认连有线" 问题）。
 static const QStringList& virtualAdapterKeys()
 {
     static const QStringList keys = {
@@ -42,7 +46,9 @@ static const QStringList& virtualAdapterKeys()
         QStringLiteral("Hyper-V"), QStringLiteral("TAP-Windows"), QStringLiteral("TAP-Windows Adapter"),
         QStringLiteral("Bluetooth"), QStringLiteral("Loopback"), QStringLiteral("Remote NDIS"),
         QStringLiteral("NDIS"), QStringLiteral("Teredo"), QStringLiteral("TUN"), QStringLiteral("TAP"),
-        QStringLiteral("NPF")
+        QStringLiteral("NPF"),
+        QStringLiteral("Radmin"), QStringLiteral("VPN"), QStringLiteral("WireGuard"),
+        QStringLiteral("Tailscale"), QStringLiteral("ZeroTier"), QStringLiteral("OpenVPN")
     };
     return keys;
 }
@@ -346,5 +352,77 @@ QStringList connectedEthernetGuids()
 bool ethernetLinkUp()
 {
     return !connectedEthernetGuids().isEmpty();
+}
+
+QString dumpAdapters()
+{
+    auto typeName = [](DWORD t) -> const char* {
+        switch (t) {
+        case IF_TYPE_ETHERNET_CSMACD:    return "Ethernet(6)";
+        case IF_TYPE_ETHERNET_3MBIT:     return "Ethernet3MBit(7)";
+        case IF_TYPE_IEEE80211:          return "Wireless(71)";
+        case IF_TYPE_SOFTWARE_LOOPBACK:  return "Loopback(24)";
+        case IF_TYPE_PPP:                return "PPP(23)";
+        case IF_TYPE_TUNNEL:             return "Tunnel(131)";
+        default:                         return "Other";
+        }
+    };
+    auto operName = [](IF_OPER_STATUS s) -> const char* {
+        switch (s) {
+        case IfOperStatusUp:             return "Up";
+        case IfOperStatusDown:           return "Down";
+        case IfOperStatusTesting:        return "Testing";
+        case IfOperStatusUnknown:        return "Unknown";
+        case IfOperStatusDormant:        return "Dormant";
+        case IfOperStatusNotPresent:     return "NotPresent";
+        case IfOperStatusLowerLayerDown: return "LowerLayerDown";
+        default:                         return "?";
+        }
+    };
+    auto isEth = [](DWORD t) {
+        return t == IF_TYPE_ETHERNET_CSMACD || t == IF_TYPE_ETHERNET_3MBIT;
+    };
+
+    const auto adapters = enumerateWin32Adapters();
+    int counted = 0;
+    QStringList out;
+    for (const auto& ra : adapters) {
+        const bool eth  = isEth(ra.ifType);
+        const bool virt = isVirtualAdapter(ra.description);
+        const bool up   = (ra.operStatus == IfOperStatusUp);
+        const bool countHere = eth && !virt && up;
+        if (countHere)
+            ++counted;
+
+        QByteArray macBytes;
+        if (ra.macLen >= 6)
+            macBytes = QByteArray(reinterpret_cast<const char*>(ra.mac), 6);
+
+        QString cls;
+        if (eth && !virt && up)
+            cls = QStringLiteral("[有线·计入]");
+        else if (eth && virt)
+            cls = QStringLiteral("[有线·未计入·虚拟]");
+        else if (eth)
+            cls = QStringLiteral("[有线·未计入·状态:%1]").arg(QLatin1String(operName(ra.operStatus)));
+        else if (ra.ifType == IF_TYPE_IEEE80211)
+            cls = QStringLiteral("[无线]");
+        else
+            cls = QStringLiteral("[其他]");
+
+        const QString mac = macBytes.isEmpty()
+                                ? QStringLiteral("(无)")
+                                : QString::fromLatin1(macBytes.toHex().toUpper());
+        out << QStringLiteral("%1  %2  guid=%3  ifType=%4  oper=%5  MAC=%6")
+               .arg(cls, ra.description, ra.guid,
+                    QLatin1String(typeName(ra.ifType)),
+                    QLatin1String(operName(ra.operStatus)),
+                    mac);
+    }
+    out << QStringLiteral("适配器总计 %1 个；ethernetLinkUp() = %2（计入 %3 个）")
+           .arg(adapters.size())
+           .arg(counted > 0 ? QStringLiteral("true") : QStringLiteral("false"))
+           .arg(counted);
+    return out.join('\n');
 }
 } // namespace Network

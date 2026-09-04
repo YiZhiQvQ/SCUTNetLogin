@@ -24,6 +24,7 @@ struct AppConfig {
     QString connectMode     = "auto";          // auto / wired / wireless
     QString wifiSsids       = "scut-student";  // SSID 白名单，逗号分隔；空 = 任意
     bool    logoutOnExit    = false;           // 退出程序时注销无线连接（可选，默认不登出）
+    bool    debugLog        = false;           // 启用调试输出（详细连接决策/网卡枚举/帧级 hex）
 };
 
 // UI 数据比较（"保存配置"脏检测等）
@@ -45,7 +46,8 @@ inline bool operator==(const AppConfig& a, const AppConfig& b)
         && a.autoConnect    == b.autoConnect
         && a.connectMode    == b.connectMode
         && a.wifiSsids      == b.wifiSsids
-        && a.logoutOnExit   == b.logoutOnExit;
+        && a.logoutOnExit   == b.logoutOnExit
+        && a.debugLog       == b.debugLog;
 }
 
 inline bool operator!=(const AppConfig& a, const AppConfig& b) { return !(a == b); }

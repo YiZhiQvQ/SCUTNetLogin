@@ -225,10 +225,16 @@ constexpr int         EPORTAL_HTTPS_PORT = 802;      // 页面变量 enHTTPSPort
 // 登录/登出端点（实测浏览器 F12 抓包，2026-09-03）：portal 入口为当前唯一可用路径
 constexpr const char* EPORTAL_LOGIN_PATH_PORTAL = "/eportal/portal/login";
 constexpr const char* EPORTAL_UNBIND_PATH       = "/eportal/portal/mac/unbind";  // 解绑下线（真注销）
-// 门户服务器默认主机名（校域名；AC 302 通常指向它）。程序运行时以"发现的门户"为准，
-// 该默认值仅在尚未发现门户时兜底（避免 unbind/状态查询缺 host）。IP 经校园 DNS 解析，
-// 校园内网 DNS 私网解析 s2.scut.edu.cn → 192.168.53.229（实测）；勿硬编码 IP。
-constexpr const char* EPORTAL_DEFAULT_HOST = "s2.scut.edu.cn";
+// 门户服务器默认主机名（候选第一名，用户更多用 s）。程序运行时以"发现的门户"为准：
+// 网关 302 或"哪个候选门户 online_list 认识本机会话"才决定真实域名；该默认值仅在
+// 尚未发现门户且未探测到在线会话时兜底。校园内网 DNS 私网解析（勿硬编码 IP）。
+constexpr const char* EPORTAL_DEFAULT_HOST = "s.scut.edu.cn";
+// 校区域门域名候选：各校区不同，网关 302 未出现（已认证放行/网关不指向门户）时，
+// 逐个用 online_list 探测——返回 result:1 且本机会话的那个即为当前 zone 的域名；
+// 全不命中则按默认登录，失败可重试时再换另一候选（见 WebAuthProcess::tryAlternateDomain）。
+inline constexpr std::array<const char*, 2> EPORTAL_HOST_CANDIDATES = {
+    "s.scut.edu.cn", "s2.scut.edu.cn"
+};
 constexpr const char* EPORTAL_LOADCONFIG_PATH   = "/eportal/portal/page/loadConfig";
 constexpr const char* EPORTAL_ONLINE_LIST_PATH  = "/eportal/portal/online_list";
 
