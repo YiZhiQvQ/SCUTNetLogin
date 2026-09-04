@@ -47,7 +47,8 @@ $copyList = @(
     @("$qt\plugins\imageformats\qjpeg.dll",  'plugins\imageformats'),
     @("$qt\plugins\imageformats\qsvg.dll",   'plugins\imageformats'),
     @("$qt\plugins\iconengines\qsvgicon.dll",'plugins\iconengines'),
-    @("$qt\plugins\networkinformation\qnetworklistmanager.dll", 'plugins\networkinformation')
+    @("$qt\plugins\networkinformation\qnetworklistmanager.dll", 'plugins\networkinformation'),
+    @("$qt\plugins\tls\qschannelbackend.dll", 'plugins\tls')   # TLS backend (Schannel): portal/login are HTTPS
 )
 foreach ($item in $copyList) {
     $src = $item[0]; $rel = $item[1]

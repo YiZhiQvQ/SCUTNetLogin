@@ -48,11 +48,9 @@ void NetworkWorker::doSetAutoStart(bool enable)
     QString taskName = QStringLiteral("SCUTNetLogin_AutoStart");
     QString appPath = QDir::toNativeSeparators(QCoreApplication::applicationFilePath());
 
-    // 先查询现有任务「实际指向的命令行」，再决定要不要动手。
-    // 原实现只在勾选状态变化时才触发，一旦 config 已是 autoStart=true 但任务仍指向别的 exe
-    // （例如从开发版换装到 Program Files），就永远不重建，开机自启形同虚设。这里改成核对
-    // 「任务真实目标 vs 当前 exe」，且仅在真正失配时才 /create 或 /delete —— 既修复错指向，
-    // 又不像早期实现那样每次保存都增删任务、制造"系统找不到指定的文件"告警。
+    // 先查询现有任务「实际指向的命令行」，再决定要不要动手。核对「任务真实目标 vs
+    // 当前 exe」，仅在真正失配（任务不存在 / 指向别的 exe / 缺 --silent）时才
+    // /create 或 /delete——修正错指向，也不在每次保存时增删任务、制造无谓告警。
     QString taskCommand, taskArgs;
     bool taskFound = false;
     {
@@ -122,7 +120,8 @@ void NetworkWorker::doSetAutoStart(bool enable)
             && taskArgs.split(QLatin1Char(' '), Qt::SkipEmptyParts)
                    .contains(QStringLiteral("--silent"));
         if (alreadyCorrect) {
-            emit autoStartDone(true, QString());
+            // 任务已正确指向当前 exe 并带 --silent：无变更，静默返回（不打印
+            // "设置成功"——该消息仅在实际创建/变更时才有意义，避免每次点连接都刷屏）
             return;
         }
 
@@ -140,8 +139,7 @@ void NetworkWorker::doSetAutoStart(bool enable)
         if (runSchTasks(native))
             emit autoStartDone(true, QString());
     } else {
-        if (!taskFound) {   // 任务本就不存在：视为成功，不为"系统找不到指定的文件"报错
-            emit autoStartDone(true, QString());
+        if (!taskFound) {   // 任务本就不存在：本就符合"未启用"目标，静默返回
             return;
         }
         const QString native = QStringLiteral("/delete /tn \"%1\" /f").arg(taskName);

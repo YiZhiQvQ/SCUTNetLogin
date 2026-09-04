@@ -160,6 +160,14 @@ enum class AuthState {
     Stopped                     // 用户主动断开
 };
 
+// 联网方式（MainWindow → SessionManager → 后端决策）。
+// Auto：以太网链路 Up 走有线（802.1X），否则当前 SSID 命中白名单走无线 Portal。
+enum class ConnectMode {
+    Auto,                       // 自动（有线优先）
+    Wired,                      // 强制有线（既有行为）
+    Wireless                    // 强制无线（Portal 认证）
+};
+
 // 静态IP配置参数（仅当 autoSetNetwork 时需要）
 // 注：原定义于 session_manager.h，因 ConnectionBuilder / 单元测试需在无
 // SessionManager 重型依赖下引用，故移入纯数据结构头的 protocol.h
@@ -183,6 +191,7 @@ struct AuthConfig {
     QString  hostname;          // 本机主机名
     uint8_t  localMac[6] = {};
     uint8_t  localIp[4]  = {};
+    QString  wifiSsid;          // 无线模式运行期字段：当前连接的 SSID（WebAuthProcess 用）
 };
 
 #endif // PROTOCOL_H

@@ -56,16 +56,22 @@ private:
 
     void applyStateUI(AppConnectionState state);
 
+    // 更新"当前连接模式"状态小字（未连接/有线/无线（SSID）），由 stateChanged 驱动
+    void updateConnectModeLabel(AppConnectionState state);
+
+    // 收集当前窗体输入并启动连接（mode 恒为自动：有线优先、无线兜底；
+    // 模式切换功能已按用户要求移除，connectMode 配置键仅向后兼容保留）
+    void connectWithCurrentInput();
+
     // 自绘状态指示器（断开=灰环 / 连接中=旋转动画 / 已连接=绿色对勾）
     void updateStatusIcon(AppConnectionState state);
-
-    QString autoDetectMacForUI();
 
 private slots:
     void on_btnRefresh_clicked();
     void on_btnConnect_clicked();
     void on_btnDisconnect_clicked();
     void on_btnSaveConfig_clicked();
+    void on_btnQueryMac_clicked();   // 查询并填充 MAC（不再自动获取，用户手动点击/命令）
 
     void onStateChanged(AppConnectionState state);
     void onLogMessage(const QString& message, int level);

@@ -19,9 +19,8 @@ QString defaultPath()
 AppConfig load(const QString& configPath)
 {
     QSettings settings(configPath, QSettings::IniFormat);
-    // 注意：【不】显式 beginGroup("General")——Qt 6.11 对显式组名会做转义
-    // 写成 [%General]，而无组默认组才写 [General]；转义后的组名无法读取
-    // 历史 config.ini（[General]），会静默回落到默认值。保持无组行为。
+    // 【不】显式 beginGroup("General")：Qt 6.11 对显式组名转义为 [%General]，
+    // 与写入时的无组默认形式 [General] 不匹配。保持无组读写。
     AppConfig cfg;
 
     cfg.username      = settings.value("username", "").toString();
@@ -33,12 +32,15 @@ AppConfig load(const QString& configPath)
     cfg.manualIp      = settings.value("manualIp", "").toString();
     cfg.manualMask    = settings.value("manualMask", "255.255.255.0").toString();
     cfg.manualGateway = settings.value("manualGateway", "").toString();
-    cfg.autoSetNetwork = settings.value("autoSetNetwork", false).toBool();
-    cfg.autoStart      = settings.value("autoStart", false).toBool();
-    cfg.autoConnect    = settings.value("autoConnect", false).toBool();
+    cfg.autoSetNetwork = settings.value("autoSetNetwork", true).toBool();
+    cfg.autoStart      = settings.value("autoStart", true).toBool();
+    cfg.autoConnect    = settings.value("autoConnect", true).toBool();
+    cfg.connectMode    = settings.value("connectMode", QString::fromLatin1(PORTAL_DEFAULT_MODE)).toString();
+    cfg.wifiSsids      = settings.value("wifiSsids",  QString::fromLatin1(PORTAL_DEFAULT_SSID)).toString();
+    cfg.logoutOnExit   = settings.value("logoutOnExit", false).toBool();
 
-    // 密码：优先按 DPAPI 密文解密；解密失败（旧版本 Base64 明文 / 数据损坏 /
-    // 非当前用户加密）则回退为直接 Base64 解码，实现旧配置无感迁移。
+    // 密码：优先按 DPAPI 密文解密；失败（非 DPAPI 密文（Base64 明文）/ 数据损坏 /
+    // 非当前用户加密）则回退为直接 Base64 解码，兼容旧明文凭据。
     const QByteArray pwdBase64 = settings.value("password", "").toByteArray();
     if (!pwdBase64.isEmpty()) {
         QString pwd = Credential::decryptPassword(pwdBase64);
@@ -68,6 +70,9 @@ void save(const QString& configPath, const AppConfig& cfg)
     settings.setValue("autoSetNetwork", cfg.autoSetNetwork);
     settings.setValue("autoStart",      cfg.autoStart);
     settings.setValue("autoConnect",    cfg.autoConnect);
+    settings.setValue("connectMode",    cfg.connectMode);
+    settings.setValue("wifiSsids",      cfg.wifiSsids);
+    settings.setValue("logoutOnExit",   cfg.logoutOnExit);
 
     if (cfg.savePassword)
         settings.setValue("password", Credential::encryptPassword(cfg.password));
@@ -121,6 +126,25 @@ void resolveAuthConfig(AuthConfig& config)
             }
         }
     }
+}
+
+ConnectMode connectModeFromString(const QString& s)
+{
+    if (s.compare(QStringLiteral("wireless"), Qt::CaseInsensitive) == 0)
+        return ConnectMode::Wireless;
+    if (s.compare(QStringLiteral("wired"), Qt::CaseInsensitive) == 0)
+        return ConnectMode::Wired;
+    return ConnectMode::Auto;    // "auto" / 未知 / 空串 → 自动（有线优先）
+}
+
+QString connectModeToString(ConnectMode m)
+{
+    switch (m) {
+    case ConnectMode::Wireless: return QStringLiteral("wireless");
+    case ConnectMode::Wired:    return QStringLiteral("wired");
+    case ConnectMode::Auto:     break;
+    }
+    return QStringLiteral("auto");
 }
 
 } // namespace ConfigManager

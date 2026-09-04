@@ -35,6 +35,9 @@ struct Input {
     QString gateway;
     QString dns1;
     QString dns2;
+    // 无线模块（追加于末尾，默认值保证既有聚合初始化兼容）
+    QString connectMode = QStringLiteral("auto");        // auto / wired / wireless
+    QString ssidRaw     = QStringLiteral("scut-student"); // SSID 白名单原文（逗号分隔）
 };
 
 // 结果：ok=false 时 error 为可显示的终止原因
@@ -47,6 +50,39 @@ struct Result {
 
 // 校验并组装连接参数。ok=false 时 error 含用户可读原因（供 UI 直接显示）。
 Result build(const Input& in);
+
+// ============================================================================
+// 无线接入后端决策 — 纯函数（SessionManager 现场取以太网链路/SSID 后调用）
+// ============================================================================
+
+// 认证后端
+enum class AuthBackend {
+    None,                       // 无可选后端（需要用户检查原因）
+    WiredEap,                   // 有线 802.1X EAPOL
+    PortalWifi                  // 无线 DrCOM Web Portal
+};
+
+struct BackendDecision {
+    AuthBackend backend = AuthBackend::None;
+    QString reason;             // backend==None 时为用户可读原因
+};
+
+// 解析 SSID 白名单：按逗号/顿号/空格切分，去空、逐项 trim。空串 → 空列表（= 任意 SSID）。
+QStringList parseSsidList(const QString& raw);
+
+// 当前 SSID 是否命中白名单（空白名单 = 任意；大小写敏感，SSID 有大小写语义）
+bool ssidMatch(const QString& currentSsid, const QStringList& whitelist);
+
+// 决策矩阵（详见 wifi_module_plan.md §3.5）：
+//   Auto       + 有线链路Up          → WiredEap（有线优先）
+//   Auto       + 链路Down + SSID命中  → PortalWifi
+//   Auto       + 链路Down + SSID未中  → None
+//   Wired      + 链路Down            → None（提示检查网线）
+//   Wired      + 链路Up/未知         → WiredEap
+//   Wireless   + SSID命中            → PortalWifi
+//   Wireless   + SSID未中            → None（提示 SSID 不在白名单）
+BackendDecision resolveAuthBackend(ConnectMode mode, bool ethernetLinkUp,
+                                   const QString& currentSsid, const QStringList& whitelist);
 
 } // namespace ConnectionBuilder
 

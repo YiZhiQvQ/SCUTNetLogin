@@ -1,4 +1,5 @@
 #include <QtTest>
+#include <QCryptographicHash>
 #include <winsock2.h>   // htons / ntohs（协议头为网络字节序）
 
 #include "eap/eapol_packet.h"
@@ -10,6 +11,8 @@
 #include "config/config_manager.h"
 #include "config/credential.h"
 #include "network/network.h"
+#include "wifi/portal_parser.h"
+#include "wifi_fixtures.h"
 
 #include <QTemporaryDir>
 #include <QSettings>
@@ -148,6 +151,21 @@ private slots:
     void credential_roundtrip();
     void configManager_roundtrip();
     void configManager_legacyBase64Fallback();
+
+    // ---------- WiFi Portal 纯逻辑（portal_parser / connection_builder） ----------
+    void portalParser_parseLiveFixture();
+    void portalParser_computeDerived();
+    void portalParser_classifySuccess();
+    void portalParser_classifyNightBlocked();
+    void portalParser_classifyUseridError();
+    void portalParser_classifyWrongPasswordGbk();
+    void portalParser_classifyGarbage();
+    void portalParser_extractJsonpCompatibility();
+    void portalParser_isOwnSession();
+    void portalParser_buildOnlineListUrl();
+    void backendDecision_matrix();
+    void ssidList_parsingAndMatch();
+    void connectMode_stringRoundtrip();
 };
 
 // ============================================================================
@@ -825,6 +843,9 @@ void TestPackets::configManager_roundtrip()
     cfg.autoSetNetwork = true;
     cfg.autoStart      = true;
     cfg.autoConnect    = true;
+    cfg.connectMode    = QStringLiteral("wireless");
+    cfg.wifiSsids      = QStringLiteral("scut-student,SCUT-5G\345\256\277");   // 含全角顿号
+    cfg.logoutOnExit   = true;
 
     ConfigManager::save(path, cfg);
 
@@ -843,6 +864,9 @@ void TestPackets::configManager_roundtrip()
     QVERIFY(loaded.autoSetNetwork);
     QVERIFY(loaded.autoStart);
     QVERIFY(loaded.autoConnect);
+    QCOMPARE(loaded.connectMode, cfg.connectMode);
+    QCOMPARE(loaded.wifiSsids,   cfg.wifiSsids);
+    QVERIFY(loaded.logoutOnExit);
 
     // 清理工作目录（失败时忽略，不影响断言结果）
     QDir(workDir).removeRecursively();
@@ -870,6 +894,224 @@ void TestPackets::configManager_legacyBase64Fallback()
 
     // 清理工作目录（失败时忽略，不影响断言结果）
     QDir(workDir).removeRecursively();
+}
+
+// ============================================================================
+// WiFi Portal 纯逻辑
+// ============================================================================
+
+void TestPackets::portalParser_parseLiveFixture()
+{
+    // 2026-09-03 实抓 a79.htm：GBK 中文（标题/注释）不得干扰 ASCII 变量提取
+    const QByteArray page = WifiFixtures::a79Page();
+    const QUrl entry(QStringLiteral("https://s2.scut.edu.cn/a79.htm?wlanacip=192.168.53.174"));
+    const PortalParser::PortalVars v = PortalParser::parse(page, entry);
+
+    QCOMPARE(v.v4serip, QStringLiteral("192.168.53.229"));
+    QCOMPARE(v.v46ip,   QStringLiteral("10.197.179.90"));
+    QCOMPARE(v.mip,     QStringLiteral("010197179090"));
+    QCOMPARE(v.ipm,     QStringLiteral("c0a835e5"));
+    QCOMPARE(v.ss1,     QStringLiteral("0010f3772b22"));
+    QCOMPARE(v.ss2,     QStringLiteral("0000"));
+    QCOMPARE(v.ss3,     QStringLiteral("0ac5b35a"));
+    QCOMPARE(v.ss4,     QStringLiteral("000000000000"));
+    QCOMPARE(v.ss5,     QStringLiteral("10.197.179.90"));
+    QCOMPARE(v.ss6,     QStringLiteral("192.168.53.229"));
+    QCOMPARE(v.vlanid,  QStringLiteral("0"));
+    QCOMPARE(v.gno,     QStringLiteral("0000"));
+    QCOMPARE(v.wlanacip, QStringLiteral("192.168.53.174"));   // 来自入口 URL query
+    QCOMPARE(v.timet,   qint64(1788394014));
+    QCOMPARE(v.authLoginPort, 801);
+    QCOMPARE(v.authUserField, QStringLiteral("DDDDD"));
+    QCOMPARE(v.authPassField, QStringLiteral("upass"));
+    QCOMPARE(v.authSuccess,   QStringLiteral("Dr.COMWebLoginID_3.htm"));
+    QVERIFY(v.isValid());
+}
+
+void TestPackets::portalParser_computeDerived()
+{
+    const uint8_t ipA[4] = { 10, 197, 179, 90 };      // 实抓观测值
+    QCOMPARE(PortalParser::computeMip(ipA), QStringLiteral("010197179090"));
+    const uint8_t ipB[4] = { 192, 168, 53, 229 };     // 服务器 IP
+    QCOMPARE(PortalParser::computeIpm(ipB), QStringLiteral("c0a835e5"));
+    QCOMPARE(PortalParser::computeSs3(ipA), QStringLiteral("0ac5b35a"));
+    // 全零输入不越界
+    const uint8_t zero[4] = {};
+    QCOMPARE(PortalParser::computeMip(zero), QStringLiteral("000000000000"));
+}
+
+void TestPackets::portalParser_classifySuccess()
+{
+    const auto r = PortalParser::classify(WifiFixtures::loginSuccess());
+    QCOMPARE(int(r.verdict), int(PortalParser::Verdict::Success));
+    QVERIFY(r.retryable);
+}
+
+void TestPackets::portalParser_classifyNightBlocked()
+{
+    // 凌晨时段拒绝："当前时段禁止使用"（GBK）→ Failure 且可重试（夜间窗口由上层处理）
+    const auto r = PortalParser::classify(WifiFixtures::loginNightBlocked());
+    QCOMPARE(int(r.verdict), int(PortalParser::Verdict::Failure));
+    QVERIFY(r.retryable);
+    QVERIFY(!r.message.isEmpty());
+}
+
+void TestPackets::portalParser_classifyUseridError()
+{
+    // 冲突/错误账号："userid error2" → Failure（ASCII 错误宏可识别；
+    // message 附诊断码 hidn=-5）
+    const auto r = PortalParser::classify(WifiFixtures::loginUseridError());
+    QCOMPARE(int(r.verdict), int(PortalParser::Verdict::Failure));
+    QVERIFY(!r.retryable);
+    QVERIFY(r.message.contains(QStringLiteral("userid error2")));
+    QVERIFY(r.message.contains(QStringLiteral("code=-5")));
+}
+
+void TestPackets::portalParser_classifyWrongPasswordGbk()
+{
+    // GBK"账号密码错误！"：msga 为 GBK 原始字节 → 必须解码命中"密码"关键词
+    // → 永久错误（不可重试）。（历史缺陷：不解码 → 判为可重试 → 每 5 分钟无限重试）
+    const auto r = PortalParser::classify(WifiFixtures::loginWrongPassword());
+    QCOMPARE(int(r.verdict), int(PortalParser::Verdict::Failure));
+    QVERIFY(!r.retryable);
+    QVERIFY(r.message.contains(QStringLiteral("密码")));
+}
+
+void TestPackets::portalParser_classifyGarbage()
+{
+    // 非 JSON（HTML 错误页/大页）→ Unknown 且可重试
+    const auto r = PortalParser::classify(QByteArrayLiteral("<html>系统发生错误</html>"));
+    QCOMPARE(int(r.verdict), int(PortalParser::Verdict::Unknown));
+    QVERIFY(r.retryable);
+}
+
+void TestPackets::portalParser_isOwnSession()
+{
+    // 本机会话（实抓 online_list）：IP/账号/MAC/ is_owner_ip 四途径均可判定
+    const QJsonObject s = PortalParser::extractJsonp(WifiFixtures::onlineListOnline())
+                              .value(QStringLiteral("list")).toArray().first().toObject();
+    QVERIFY(PortalParser::isOwnSession(s, QStringLiteral("10.197.179.90"),
+                                       QStringLiteral("testaccount")));
+    QVERIFY(PortalParser::isOwnSession(s, QString(), QString(), QStringLiteral("C40F089D34BF")));
+
+    // 他机会话：IP（10.197.179.91）/账号（otheruser@wifi）/MAC 与 is_owner_ip=0 全部不符
+    const QJsonObject f = PortalParser::extractJsonp(WifiFixtures::onlineListForeign())
+                              .value(QStringLiteral("list")).toArray().first().toObject();
+    QVERIFY(!PortalParser::isOwnSession(f, QStringLiteral("10.197.179.90"),
+                                        QStringLiteral("testaccount")));
+    QVERIFY(!PortalParser::isOwnSession(f, QStringLiteral("10.197.179.90"),
+                                        QStringLiteral("somebody"), QStringLiteral("000000000000")));
+
+    // 变体：无 is_owner_ip 字段时，online_ip / online_mac 单独命中
+    QJsonObject ipOnly;
+    ipOnly.insert(QStringLiteral("online_ip"), QStringLiteral("10.197.179.90"));
+    QVERIFY(PortalParser::isOwnSession(ipOnly, QStringLiteral("10.197.179.90"), QString()));
+    QJsonObject macOnly;
+    macOnly.insert(QStringLiteral("online_mac"), QStringLiteral("c40f089d34bf"));
+    QVERIFY(PortalParser::isOwnSession(macOnly, QString(), QString(), QStringLiteral("C40F089D34BF")));
+
+    // 空条目防御
+    QVERIFY(!PortalParser::isOwnSession({}, QStringLiteral("10.197.179.90"),
+                                        QStringLiteral("testaccount")));
+}
+
+void TestPackets::portalParser_buildOnlineListUrl()
+{
+    // 2026-09-03 实测参数组合（IP=10.197.179.90 → 0x0AC5B35A=180728666）
+    const QUrl u = PortalParser::buildOnlineListUrl(
+        QStringLiteral("https://s2.scut.edu.cn"), EPORTAL_HTTPS_PORT,
+        0x0AC5B35A, QStringLiteral("C40F089D34BF"),
+        QLatin1String(EPORTAL_JS_VERSION), QStringLiteral("dr123456"), 7777);
+    // 注意：QUrl 对空 query 值渲染为 "user_account"（无 "="）
+    QCOMPARE(u.toString(QUrl::FullyDecoded),
+             QStringLiteral("https://s2.scut.edu.cn:802/eportal/portal/online_list"
+                            "?user_account&user_password=123"
+                            "&wlan_user_mac=C40F089D34BF"
+                            "&wlan_user_ip=180728666&curr_user_ip=180728666"
+                            "&jsVersion=4.1.3&callback=dr123456&v=7777&lang=zh"));
+
+    // 全零 MAC = 协议约定"空 MAC"值；IP=0（接口未取到时的兜底形态）
+    const QUrl z = PortalParser::buildOnlineListUrl(
+        QStringLiteral("http://127.0.0.1"), EPORTAL_HTTP_PORT,
+        0, QStringLiteral("000000000000"),
+        QLatin1String(EPORTAL_JS_VERSION), QStringLiteral("dr1"), 1);
+    QVERIFY(z.toString(QUrl::FullyDecoded).contains(QStringLiteral("wlan_user_ip=0")));
+    QVERIFY(z.toString(QUrl::FullyDecoded).contains(QStringLiteral("wlan_user_mac=000000000000")));
+}
+
+void TestPackets::portalParser_extractJsonpCompatibility()
+{
+    // 兼容 jsonpReturn(...) 与 drNNNN(...) 前缀
+    const QJsonObject a = PortalParser::extractJsonp(
+        QByteArrayLiteral("jsonpReturn({\"code\":1,\"msg\":\"ok\"})"));
+    QCOMPARE(a.value(QStringLiteral("code")).toInt(), 1);
+    const QJsonObject b = PortalParser::extractJsonp(WifiFixtures::onlineListOnline());
+    QCOMPARE(b.value(QStringLiteral("result")).toInt(), 1);
+    const QJsonObject c = PortalParser::extractJsonp(QByteArrayLiteral("not json at all"));
+    QVERIFY(c.isEmpty());
+}
+
+void TestPackets::backendDecision_matrix()
+{
+    // 与 wifi_module_plan.md §3.5 决策矩阵逐行对齐
+    using B = ConnectionBuilder::AuthBackend;
+    const QStringList allow { QStringLiteral("scut-student") };
+
+    QCOMPARE(ConnectionBuilder::resolveAuthBackend(
+                 ConnectMode::Auto, true, QStringLiteral("scut-student"), allow).backend,
+             B::WiredEap);                                  // auto+有线Up → 有线优先
+    QCOMPARE(ConnectionBuilder::resolveAuthBackend(
+                 ConnectMode::Auto, false, QStringLiteral("scut-student"), allow).backend,
+             B::PortalWifi);                                // auto+无有线+命中 → 无线
+    QCOMPARE(ConnectionBuilder::resolveAuthBackend(
+                 ConnectMode::Auto, false, QStringLiteral("OtherSSID"), allow).backend,
+             B::None);                                      // auto+未命中 → None
+    QCOMPARE(ConnectionBuilder::resolveAuthBackend(
+                 ConnectMode::Wired, false, QString(), allow).backend,
+             B::None);                                      // 手动有线+链路Down → None
+    QCOMPARE(ConnectionBuilder::resolveAuthBackend(
+                 ConnectMode::Wired, true, QString(), allow).backend,
+             B::WiredEap);                                  // 手动有线+Up → 有线
+    QCOMPARE(ConnectionBuilder::resolveAuthBackend(
+                 ConnectMode::Wireless, true, QStringLiteral("OtherSSID"), allow).backend,
+             B::None);                                      // 手动无线+未命中 → None
+    QCOMPARE(ConnectionBuilder::resolveAuthBackend(
+                 ConnectMode::Wireless, true, QStringLiteral("scut-student"), allow).backend,
+             B::PortalWifi);                                // 手动无线+命中 → 无线
+
+    // 空白名单 = 任意 SSID
+    QCOMPARE(ConnectionBuilder::resolveAuthBackend(
+                 ConnectMode::Wireless, false, QStringLiteral("MyHotspot"), {}).backend,
+             B::PortalWifi);
+}
+
+void TestPackets::ssidList_parsingAndMatch()
+{
+    QCOMPARE(ConnectionBuilder::parseSsidList(QStringLiteral("scut-student")),
+             QStringList{ QStringLiteral("scut-student") });
+    // 逗号/全角逗号/顿号/空格混合
+    QCOMPARE(ConnectionBuilder::parseSsidList(QStringLiteral(" scut-student, SCUT-5G\345\256\277,  graduate ;SCUT")),
+             QStringList({ QStringLiteral("scut-student"), QStringLiteral("SCUT-5G\345\256\277"),
+                           QStringLiteral("graduate"), QStringLiteral("SCUT") }));
+    QVERIFY(ConnectionBuilder::parseSsidList(QStringLiteral("   ")).isEmpty());
+
+    const QStringList allow { QStringLiteral("scut-student"), QStringLiteral("SCUT-5G") };
+    QVERIFY(ConnectionBuilder::ssidMatch(QStringLiteral("scut-student"), allow));
+    QVERIFY(!ConnectionBuilder::ssidMatch(QStringLiteral("other"), allow));
+    QVERIFY(ConnectionBuilder::ssidMatch(QStringLiteral("any"), {}));   // 空白名单=任意
+    QVERIFY(!ConnectionBuilder::ssidMatch(QString(), allow));           // 无 SSID 不匹配
+}
+
+void TestPackets::connectMode_stringRoundtrip()
+{
+    QCOMPARE(ConfigManager::connectModeFromString(QStringLiteral("wireless")), ConnectMode::Wireless);
+    QCOMPARE(ConfigManager::connectModeFromString(QStringLiteral("WIRED")),  ConnectMode::Wired);
+    QCOMPARE(ConfigManager::connectModeFromString(QStringLiteral("auto")),   ConnectMode::Auto);
+    QCOMPARE(ConfigManager::connectModeFromString(QString()),                ConnectMode::Auto);
+    QCOMPARE(ConfigManager::connectModeFromString(QStringLiteral("other")),  ConnectMode::Auto);
+    QCOMPARE(ConfigManager::connectModeToString(ConnectMode::Wireless), QStringLiteral("wireless"));
+    QCOMPARE(ConfigManager::connectModeToString(ConnectMode::Wired),    QStringLiteral("wired"));
+    QCOMPARE(ConfigManager::connectModeToString(ConnectMode::Auto),     QStringLiteral("auto"));
 }
 
 QTEST_APPLESS_MAIN(TestPackets)

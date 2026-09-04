@@ -14,6 +14,8 @@ LIBS += -L"C:/npcap-sdk/Lib/x64" -lwpcap -lPacket -lws2_32 -liphlpapi
 LIBS += -lcrypt32
 # 管理员权限检查（main.cpp: OpenProcessToken / GetTokenInformation）
 LIBS += -ladvapi32
+# WLAN API（无线 SSID 查询与接口枚举，Windows SDK 自带；仅 src/wifi/wlan_media.cpp）
+LIBS += -lwlanapi
 # 管理员权限清单：不再用 QMAKE_LFLAGS /MANIFESTUAC（其引号会被 linker 剥掉，
 # 生成无引号的畸形 manifest，导致 SxS "并行配置不正确" 启动失败）。
 # 改用 .rc 嵌入 src/app.manifest 标准模板（见 app.rc）。
@@ -38,7 +40,10 @@ SOURCES += \
     src/network/network.cpp \
     src/udp/drcom_packet.cpp \
     src/eap/eapol_packet.cpp \
-    src/log/log_manager.cpp
+    src/log/log_manager.cpp \
+    src/wifi/portal_parser.cpp \
+    src/wifi/webauth_process.cpp \
+    src/wifi/wlan_media.cpp
 
 HEADERS += \
     src/ui/mainwindow.h \
@@ -57,7 +62,10 @@ HEADERS += \
     src/core/constants.h \
     src/udp/drcom_packet.h \
     src/eap/eapol_packet.h \
-    src/log/log_manager.h
+    src/log/log_manager.h \
+    src/wifi/portal_parser.h \
+    src/wifi/webauth_process.h \
+    src/wifi/wlan_media.h
 
 FORMS += src/ui/mainwindow.ui
 

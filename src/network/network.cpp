@@ -6,10 +6,12 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <ifdef.h>
 #include <QProcess>
 #include <QRegularExpression>
 #include <QNetworkInterface>
 #include <QSet>
+#include <QtEndian>
 #include <vector>
 #include <QDebug>
 #include <pcap.h>
@@ -26,7 +28,33 @@ struct RawWin32Adapter {
     BYTE    mac[8]{};       // PhysicalAddress (max 8, typically 6)
     ULONG   macLen = 0;
     DWORD   ifType = 0;
+    // IP_ADAPTER_ADDRESSES::OperStatus 为 IF_OPER_STATUS（iphlpapi <ifdef.h> 枚举，
+    // 与 NET_IF_OPER_STATUS 是不同 typedef，不可混用）
+    IF_OPER_STATUS operStatus = IfOperStatusUnknown;   // 链路状态（有线插入检测）
 };
+
+// 虚拟/干扰适配器排除关键词（有线链路检测；USB 手机共享、虚拟机、蓝牙等不算
+// "物理有线网口"，避免 auto 模式被 USB 共享网卡误导为"网线已插入"）
+static const QStringList& virtualAdapterKeys()
+{
+    static const QStringList keys = {
+        QStringLiteral("Virtual"), QStringLiteral("VMware"), QStringLiteral("VirtualBox"),
+        QStringLiteral("Hyper-V"), QStringLiteral("TAP-Windows"), QStringLiteral("TAP-Windows Adapter"),
+        QStringLiteral("Bluetooth"), QStringLiteral("Loopback"), QStringLiteral("Remote NDIS"),
+        QStringLiteral("NDIS"), QStringLiteral("Teredo"), QStringLiteral("TUN"), QStringLiteral("TAP"),
+        QStringLiteral("NPF")
+    };
+    return keys;
+}
+
+static bool isVirtualAdapter(const QString& description)
+{
+    for (const QString& key : virtualAdapterKeys()) {
+        if (description.contains(key, Qt::CaseInsensitive))
+            return true;
+    }
+    return false;
+}
 
 static std::vector<RawWin32Adapter> enumerateWin32Adapters()
 {
@@ -42,6 +70,7 @@ static std::vector<RawWin32Adapter> enumerateWin32Adapters()
             ra.guid        = QString::fromLatin1(a->AdapterName);
             ra.description = QString::fromWCharArray(a->Description);
             ra.ifType      = a->IfType;
+            ra.operStatus  = a->OperStatus;
             ra.macLen      = a->PhysicalAddressLength;
             if (ra.macLen > 0 && ra.macLen <= sizeof(ra.mac))
                 memcpy(ra.mac, a->PhysicalAddress, ra.macLen);
@@ -294,4 +323,28 @@ bool setDhcp(const QString& winName, QString* errorMsg)
     return ok;
 }
 
+// ============================================================================
+// 链路状态
+// ============================================================================
+
+QStringList connectedEthernetGuids()
+{
+    QStringList result;
+    for (const auto& ra : enumerateWin32Adapters()) {
+        // 仅物理 Ethernet（ipifcons.h: IF_TYPE_ETHERNET_CSMACD=6），排除 802.11 与虚拟网卡
+        if (ra.ifType != IF_TYPE_ETHERNET_CSMACD && ra.ifType != IF_TYPE_ETHERNET_3MBIT)
+            continue;
+        if (isVirtualAdapter(ra.description))
+            continue;
+        if (ra.operStatus != IfOperStatusUp)
+            continue;
+        result << ra.guid;
+    }
+    return result;
+}
+
+bool ethernetLinkUp()
+{
+    return !connectedEthernetGuids().isEmpty();
+}
 } // namespace Network

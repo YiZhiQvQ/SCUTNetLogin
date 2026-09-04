@@ -17,9 +17,13 @@ struct AppConfig {
     QString manualMask      = "255.255.255.0";
     QString manualGateway;
     bool    savePassword    = false;
-    bool    autoSetNetwork  = false;
-    bool    autoStart       = false;
-    bool    autoConnect     = false;
+    bool    autoSetNetwork  = true;    // 默认开启：连接时配置静态 IP（首次使用需填 IP/DNS，已有配置不受影响）
+    bool    autoStart       = true;    // 默认开启：开机自启动
+    bool    autoConnect     = true;    // 默认开启：打开程序自动发起连接（静默启动恒自动连，不受此值影响）
+    // 无线模块（Portal 认证）
+    QString connectMode     = "auto";          // auto / wired / wireless
+    QString wifiSsids       = "scut-student";  // SSID 白名单，逗号分隔；空 = 任意
+    bool    logoutOnExit    = false;           // 退出程序时注销无线连接（可选，默认不登出）
 };
 
 // UI 数据比较（"保存配置"脏检测等）
@@ -38,7 +42,10 @@ inline bool operator==(const AppConfig& a, const AppConfig& b)
         && a.savePassword   == b.savePassword
         && a.autoSetNetwork == b.autoSetNetwork
         && a.autoStart      == b.autoStart
-        && a.autoConnect    == b.autoConnect;
+        && a.autoConnect    == b.autoConnect
+        && a.connectMode    == b.connectMode
+        && a.wifiSsids      == b.wifiSsids
+        && a.logoutOnExit   == b.logoutOnExit;
 }
 
 inline bool operator!=(const AppConfig& a, const AppConfig& b) { return !(a == b); }
@@ -60,6 +67,10 @@ AuthConfig toAuthConfig(const AppConfig& cfg);
 // 填充 AuthConfig 的运行时字段（hostname、DNS server IP 解析、IP 回退）
 // 调用时机：toAuthConfig 之后、传入 SessionManager 之前
 void resolveAuthConfig(AuthConfig& config);
+
+// 联网方式字符串 ↔ 枚举（未知/空串回落为 Auto；UI 与 SessionManager 共用）
+ConnectMode connectModeFromString(const QString& s);
+QString     connectModeToString(ConnectMode m);
 
 } // namespace ConfigManager
 

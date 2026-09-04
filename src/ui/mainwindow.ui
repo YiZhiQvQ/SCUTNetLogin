@@ -3,10 +3,10 @@
  <class>MainWindow</class>
  <widget class="QMainWindow" name="MainWindow">
   <property name="geometry">
-   <rect><x>0</x><y>0</y><width>480</width><height>620</height></rect>
+   <rect><x>0</x><y>0</y><width>480</width><height>680</height></rect>
   </property>
   <property name="minimumSize">
-   <size><width>440</width><height>580</height></size>
+   <size><width>460</width><height>660</height></size>
   </property>
   <property name="windowTitle">
    <string>SCUT 校园网认证</string>
@@ -56,7 +56,7 @@
          </item>
          <item>
           <widget class="QLabel" name="label_subtitle">
-           <property name="text"><string>华南理工大学 · 802.1X 客户端</string></property>
+           <property name="text"><string>华南理工大学·学生校园网认证客户端</string></property>
           </widget>
          </item>
         </layout>
@@ -154,6 +154,7 @@
              </item>
              <item row="0" column="1">
               <widget class="QLineEdit" name="editUsername">
+               <property name="minimumSize"><size><width>0</width><height>32</height></size></property>
                <property name="placeholderText"><string>校园网账号</string></property>
               </widget>
              </item>
@@ -168,6 +169,7 @@
                <property name="spacing"><number>12</number></property>
                <item>
                 <widget class="QLineEdit" name="editPassword">
+                 <property name="minimumSize"><size><width>0</width><height>32</height></size></property>
                  <property name="echoMode"><enum>QLineEdit::Password</enum></property>
                  <property name="placeholderText"><string>校园网密码</string></property>
                  <property name="clearButtonEnabled"><bool>true</bool></property>
@@ -180,6 +182,13 @@
                 </widget>
                </item>
               </layout>
+             </item>
+             <item row="2" column="0" colspan="2">
+              <widget class="QLabel" name="labelWifiStatus">
+               <property name="text"><string>当前连接模式：未连接</string></property>
+               <property name="wordWrap"><bool>true</bool></property>
+               <property name="styleSheet"><string notr="true">color: #9ca3af;</string></property>
+              </widget>
              </item>
             </layout>
            </item>
@@ -245,6 +254,12 @@
              <property name="minimumSize">
               <size><width>0</width><height>110</height></size>
              </property>
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+               <horstretch>0</horstretch>
+               <verstretch>1</verstretch>
+              </sizepolicy>
+             </property>
              <property name="readOnly"><bool>true</bool></property>
              <property name="maximumBlockCount"><number>1000</number></property>
             </widget>
@@ -287,7 +302,7 @@
                <property name="bottomMargin"><number>16</number></property>
                <item>
                 <widget class="QLabel" name="lblTitleNetwork">
-                 <property name="text"><string>网络与网卡配置</string></property>
+                 <property name="text"><string>有线网络配置</string></property>
                  <property name="cardTitle" stdset="0"><bool>true</bool></property>
                 </widget>
                </item>
@@ -330,9 +345,22 @@
                   </widget>
                  </item>
                  <item row="1" column="1">
-                  <widget class="QLineEdit" name="editMac">
-                   <property name="placeholderText"><string>留空自动获取，如 00:11:22:33:44:55</string></property>
-                  </widget>
+                  <layout class="QHBoxLayout" name="macRowLayout">
+                   <property name="spacing"><number>8</number></property>
+                   <item>
+                    <widget class="QLineEdit" name="editMac">
+                     <property name="placeholderText"><string>点击右侧查询，或手动填写，如 00:11:22:33:44:55</string></property>
+                    </widget>
+                   </item>
+                   <item>
+                    <widget class="QPushButton" name="btnQueryMac">
+                     <property name="minimumSize"><size><width>64</width><height>34</height></size></property>
+                     <property name="text"><string>查询</string></property>
+                     <property name="toolTip"><string>根据选中的网卡查询 MAC 地址</string></property>
+                     <property name="cursor"><cursorShape>PointingHandCursor</cursorShape></property>
+                    </widget>
+                   </item>
+                  </layout>
                  </item>
                  <item row="2" column="0">
                   <widget class="QLabel" name="label_ip">
@@ -394,45 +422,62 @@
                    <property name="text"><string>连接时配置静态IP，断开时恢复DHCP</string></property>
                   </widget>
                  </item>
-                </layout>
-               </item>
-              </layout>
-             </widget>
-            </item>
-            <!-- 认证服务器 -->
-            <item>
-             <widget class="QFrame" name="cardServer">
-              <property name="card" stdset="0"><bool>true</bool></property>
-              <layout class="QVBoxLayout" name="serverCardLayout">
-               <property name="spacing"><number>12</number></property>
-               <property name="leftMargin"><number>18</number></property>
-               <property name="topMargin"><number>16</number></property>
-               <property name="rightMargin"><number>18</number></property>
-               <property name="bottomMargin"><number>16</number></property>
-               <item>
-                <widget class="QLabel" name="lblTitleServer">
-                 <property name="text"><string>认证服务器</string></property>
-                 <property name="cardTitle" stdset="0"><bool>true</bool></property>
-                </widget>
-               </item>
-               <item>
-                <layout class="QFormLayout" name="formHost">
-                 <property name="horizontalSpacing"><number>14</number></property>
-                 <property name="verticalSpacing"><number>10</number></property>
-                 <property name="fieldGrowthPolicy"><enum>QFormLayout::AllNonFixedFieldsGrow</enum></property>
-                 <property name="labelAlignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
-                 <item row="0" column="0">
+                 <item row="8" column="0">
                   <widget class="QLabel" name="label_host">
-                   <property name="text"><string>服务器</string></property>
+                   <property name="text"><string>认证服务器</string></property>
                    <property name="formLabel" stdset="0"><bool>true</bool></property>
                   </widget>
                  </item>
-                 <item row="0" column="1">
+                 <item row="8" column="1">
                   <widget class="QLineEdit" name="editHost">
                    <property name="text"><string>s.scut.edu.cn</string></property>
                   </widget>
                  </item>
                 </layout>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <!-- 无线网络配置 -->
+            <item>
+             <widget class="QFrame" name="cardWifi">
+              <property name="card" stdset="0"><bool>true</bool></property>
+              <layout class="QVBoxLayout" name="wifiCardLayout">
+               <property name="spacing"><number>10</number></property>
+               <property name="leftMargin"><number>18</number></property>
+               <property name="topMargin"><number>16</number></property>
+               <property name="rightMargin"><number>18</number></property>
+               <property name="bottomMargin"><number>16</number></property>
+               <item>
+                <widget class="QLabel" name="lblTitleWifi">
+                 <property name="text"><string>无线网络配置</string></property>
+                 <property name="cardTitle" stdset="0"><bool>true</bool></property>
+                </widget>
+               </item>
+               <item>
+                <layout class="QFormLayout" name="formWifiSsid">
+                 <property name="horizontalSpacing"><number>14</number></property>
+                 <property name="verticalSpacing"><number>10</number></property>
+                 <property name="fieldGrowthPolicy"><enum>QFormLayout::AllNonFixedFieldsGrow</enum></property>
+                 <property name="labelAlignment"><set>Qt::AlignRight|Qt::AlignVCenter</set></property>
+                 <item row="0" column="0">
+                  <widget class="QLabel" name="label_ssid">
+                   <property name="text"><string>无线网络名称</string></property>
+                   <property name="formLabel" stdset="0"><bool>true</bool></property>
+                  </widget>
+                 </item>
+                 <item row="0" column="1">
+                  <widget class="QLineEdit" name="editSsid">
+                   <property name="placeholderText"><string>多个SSID用逗号分隔，留空=任意（默认 scut-student）</string></property>
+                  </widget>
+                 </item>
+                </layout>
+               </item>
+               <item>
+                <widget class="QCheckBox" name="checkLogoutOnExit">
+                 <property name="text"><string>退出时注销无线连接</string></property>
+                 <property name="toolTip"><string>勾选后关闭程序会对无线执行注销下线；不勾选则保持在线（默认）</string></property>
+                </widget>
                </item>
               </layout>
              </widget>

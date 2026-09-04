@@ -234,8 +234,9 @@ QPushButton#btnSaveConfig:hover {
 QPushButton#btnSaveConfig:pressed { background: #1f46bd; }
 QPushButton#btnSaveConfig:disabled { background: #c4d4fb; color: #eef3ff; }
 
-/* ----- 幽灵小按钮：刷新 / 复制 / 清空 ----- */
+/* ----- 幽灵小按钮：刷新 / 查询 / 复制 / 清空 ----- */
 QPushButton#btnRefresh,
+QPushButton#btnQueryMac,
 QPushButton#btnCopyLog,
 QPushButton#btnClearLog {
     background: #f1f5f9;
@@ -245,12 +246,14 @@ QPushButton#btnClearLog {
     padding: 5px 12px;
 }
 QPushButton#btnRefresh:hover,
+QPushButton#btnQueryMac:hover,
 QPushButton#btnCopyLog:hover,
 QPushButton#btnClearLog:hover {
     background: #e2e8f0;
     color: #0f172a;
 }
 QPushButton#btnRefresh:pressed,
+QPushButton#btnQueryMac:pressed,
 QPushButton#btnCopyLog:pressed,
 QPushButton#btnClearLog:pressed { background: #d8dee9; }
 

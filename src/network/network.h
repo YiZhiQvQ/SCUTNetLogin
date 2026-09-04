@@ -46,6 +46,21 @@ bool setStaticIp(const QString& winName, const QString& ip, const QString& mask,
                  QString* errorMsg = nullptr);
 bool setDhcp(const QString& winName, QString* errorMsg = nullptr);
 
+// ============================================================================
+// 链路状态（auto 模式决策与无线 Portal 模块使用）
+// ============================================================================
+
+// 物理有线（非虚拟）且链路 Up 的适配器 GUID 列表
+QStringList connectedEthernetGuids();
+
+// 是否存在"物理有线且链路 Up"的网卡（auto 模式有线优先的判据）
+// 自动排除 VMware/Hyper-V/TAP/蓝牙/USB NDIS 等虚拟适配器
+bool ethernetLinkUp();
+
+// 注：wlanapi 相关封装（currentWifiConnection / wifiDefaultGateway）已移至
+// wifi/wlan_media.h（仅无线模块使用；无线断开采用门户 mac/unbind 解绑，
+// 不做物理断开，故不再需要 WlanDisconnect）
+
 } // namespace Network
 
 #endif // NETWORK_H

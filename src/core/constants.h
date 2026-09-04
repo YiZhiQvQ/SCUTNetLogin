@@ -192,6 +192,9 @@ constexpr const char* DEFAULT_DNS = "202.38.193.33";
 constexpr int BG_TASK_WAIT_TIMEOUT = 20000;
 // netsh 命令超时 (ms)
 constexpr int NETSH_TIMEOUT = 15000;
+// 自动联动（有线↔无线）执行前的链路稳定等待：插拔网线/端口就绪常有数百 ms 抖动，
+// 立即切换还会在链路上电前发出 802.1X 探测被拒（实测"认证被拒绝"）
+constexpr int CONNECT_SWITCH_DELAY_MS = 3000;
 // 静态 IP 设置安全超时 (ms) — 超过此时间未完成则强制恢复状态
 constexpr int IP_SETUP_TIMEOUT = 30000;
 // 自动连接延迟 (ms)
@@ -210,5 +213,59 @@ constexpr int PCAP_SNAPLEN = 1514;
 
 // 以太网头部字节数
 constexpr int ETH_HEADER_SIZE = 14;
+
+// ============================================================================
+// 八、无线 Portal 认证常量 — 逆向自 SCUT 无线校园网 Dr.COM WebLoginID 4.0
+//    （2026-09-03 实测闭环，协议细节见 docs/wifi_auth_logic.md）
+// ============================================================================
+
+// —— Dr.COM eportal 端点 ——
+constexpr int         EPORTAL_HTTP_PORT  = 801;      // 页面变量 epHTTPPort
+constexpr int         EPORTAL_HTTPS_PORT = 802;      // 页面变量 enHTTPSPort（enableHttps=1 时其生效）
+// 登录/登出端点（实测浏览器 F12 抓包，2026-09-03）：portal 入口为当前唯一可用路径
+constexpr const char* EPORTAL_LOGIN_PATH_PORTAL = "/eportal/portal/login";
+constexpr const char* EPORTAL_UNBIND_PATH       = "/eportal/portal/mac/unbind";  // 解绑下线（真注销）
+// 门户服务器默认主机名（校域名；AC 302 通常指向它）。程序运行时以"发现的门户"为准，
+// 该默认值仅在尚未发现门户时兜底（避免 unbind/状态查询缺 host）。IP 经校园 DNS 解析，
+// 校园内网 DNS 私网解析 s2.scut.edu.cn → 192.168.53.229（实测）；勿硬编码 IP。
+constexpr const char* EPORTAL_DEFAULT_HOST = "s2.scut.edu.cn";
+constexpr const char* EPORTAL_LOADCONFIG_PATH   = "/eportal/portal/page/loadConfig";
+constexpr const char* EPORTAL_ONLINE_LIST_PATH  = "/eportal/portal/online_list";
+
+// 注：login 表单字段（DDDDD/upass/0MKKey=123456）属于已废弃的 /drcom/login 风格，
+// 协议知识仅存档于 docs/wifi_auth_logic.md §5（eportal 登录参数为浏览器表单复制）。
+constexpr const char* EPORTAL_JS_VERSION = "4.1.3";        // jsVersion
+constexpr const char* EPORTAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/126.0.0.0 Safari/537.36";
+// 门户 page.name / program_index 默认值（a41.js 内嵌），loadConfig 可下发同名值
+constexpr const char* EPORTAL_PORTAL_NAME = "umqIDC1745977172";
+// 无线账号后缀（online_list 中的 user_account 形如 "<账号>@wifi"，登录可无后缀）
+constexpr const char* EPORTAL_ACCOUNT_SUFFIX = "@wifi";
+// online_list 查询的固定账号口令（user_account 由本机 IP/MAC 决定，不参与查询）
+constexpr const char* EPORTAL_PORTAL_LOGOUT_PASSWORD = "123";
+
+// —— 行为时序 (ms) ——
+constexpr int PORTAL_FETCH_TIMEOUT_MS         = 8000;   // 单次 HTTP 传输超时
+constexpr int PORTAL_LOGIN_TIMEOUT_MS         = 10000;  // 登录请求超时
+constexpr int PORTAL_MAX_REDIRECTS            = 6;      // 手动跟随重定向链上限
+constexpr int WIFI_RECHECK_INTERVAL_MS        = 60 * 1000;       // 在线期轮询间隔
+constexpr int WIFI_CONFIRM_TIMEOUT_MS         = 90 * 1000;       // 登录后等放行确认（实测可延迟 ~90s）
+constexpr int WIFI_LOGOUT_TIMEOUT_MS          = 10 * 1000;       // 登出确认等待（mac/unbind 传输超时）
+
+// 阶段细分时序（原本散落为进程内字面量，统一收口至此）
+constexpr int WIFI_GATEWAY_PROBE_TIMEOUT_MS   = 6000;   // 网关 302 探测超时（局域网内，瞬态）
+constexpr int WIFI_PRELOGIN_TIMEOUT_MS        = 3000;   // 登录前在线预检超时（失败视为未在线，不阻塞主流程）
+constexpr int WIFI_RETRY_DELAY_MS             = 1500;   // 门户页/配置抓取瞬态失败的重试间隔
+constexpr int WIFI_CONFIRM_POLL_MS            = 8000;   // online_list 上线确认轮询间隔
+
+// —— 门户入口页 ——
+// 入口页路径模板：真实入口由 AC 302 动态下发（各校区/AC 部署不同，禁止硬编码
+// 入口 host），此常量仅记录"302 后拼接 wlanacip 参数"的入口页形态
+constexpr const char* PORTAL_ENTRY_PATH       = "/a79.htm?wlanacip=";
+
+// —— 默认配置 ——
+constexpr const char* PORTAL_DEFAULT_MODE     = "auto";           // AppConfig.connectMode
+constexpr const char* PORTAL_DEFAULT_SSID     = "scut-student";   // AppConfig.wifiSsids
 
 #endif // CONSTANTS_H

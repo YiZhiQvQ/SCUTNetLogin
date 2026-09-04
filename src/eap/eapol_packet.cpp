@@ -144,8 +144,8 @@ bool parseEapPacket(const QByteArray& data, EAPHeader* outEapHeader, QByteArray*
     *outEapHeader = hdr;
 
     // payload 长度：Request/Response 含 type 字节（len-5）；Success/Failure 无
-    // type 字节（len-4）。旧实现对 Success/Failure 也按 len-5 计算，长 1 字节的
-    // 奇异帧会少算 payload——此处按 EAP 头部结构精确计算。
+    // type 字节（len-4）。Success/Failure 若也按 len-5 计算，长 1 字节的帧会少算
+    // payload——这里按 EAP 头部结构精确计算。
     const int payloadOffset = EAP_HEADER_OFFSET + 4 + (hasType ? 1 : 0);
     const int payloadSize   = ntohs(hdr.length) - (hasType ? 5 : 4);
 

@@ -104,7 +104,7 @@ bool EapProcess::openDevice()
         pcap_freecode(&fp);
     } else {
         // 过滤器编译失败不致命：无过滤器也能工作（会收到全部流量），
-        // 记入 UI 日志通道（此前仅 qWarning，用户不可见）
+        // 记入 UI 日志通道便于用户感知
         log(LogLevel::Warning, QStringLiteral("BPF 过滤器编译失败，将无过滤器运行: ")
                                    + QString::fromUtf8(pcap_geterr(m_handle)));
     }
@@ -391,7 +391,7 @@ bool EapProcess::processEapPacket(const QByteArray& packet)
 
     const EthHeader* eth = reinterpret_cast<const EthHeader*>(packet.data());
 
-    // 早期握手中嗅探交换机 MAC（用于后续单播）
+    // 握手过程中嗅探交换机 MAC（后续单播用）
     if (m_currentState == AuthState::Idle || m_currentState == AuthState::SendingStart) {
         if (!isMulticastMac(eth->src_mac))
             memcpy(m_switchMac, eth->src_mac, 6);

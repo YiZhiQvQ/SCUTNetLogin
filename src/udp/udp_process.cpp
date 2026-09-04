@@ -105,8 +105,8 @@ void UdpProcess::sendUdpPacket(const char* data, size_t len)
     // 发送失败/部分发送【静默】处理：
     // 本网络环境服务器不响应 UDP 心跳属常见现象（不影响上网），且心跳失败在
     // 上层本就是有意忽略（见 SessionManager::onHeartbeatFailed()），因此不在
-    // 界面日志打任何发送失败信息（此前"UDP 部分发送 0/N"刷屏且无诊断价值）。
-    // 仅保留超时判定的既有机制（onHeartbeatTimeout，同样静默）。
+    // 界面日志打发送失败信息（"UDP 部分发送 0/N"刷屏且无诊断价值）。
+    // 仅保留超时判定（onHeartbeatTimeout，同样静默）。
     if (written < 0)
         return;
     m_timeoutTimer->start();

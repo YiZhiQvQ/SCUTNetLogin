@@ -90,4 +90,63 @@ Result build(const Input& in)
     return r;
 }
 
+// ============================================================================
+// 无线接入后端决策（纯函数）
+// ============================================================================
+
+QStringList parseSsidList(const QString& raw)
+{
+    QStringList result;
+    // 兼容逗号（半角/全角）、顿号、分号、空格分隔
+    static const QRegularExpression sep(QStringLiteral(R"([,，、;；\s]+)"));
+    for (const QString& part : raw.split(sep, Qt::SkipEmptyParts)) {
+        const QString s = part.trimmed();
+        if (!s.isEmpty())
+            result << s;
+    }
+    return result;
+}
+
+bool ssidMatch(const QString& currentSsid, const QStringList& whitelist)
+{
+    if (currentSsid.isEmpty())
+        return false;
+    if (whitelist.isEmpty())
+        return true;    // 空白名单 = 任意
+    return whitelist.contains(currentSsid);
+}
+
+BackendDecision resolveAuthBackend(ConnectMode mode, bool ethernetLinkUp,
+                                   const QString& currentSsid, const QStringList& whitelist)
+{
+    switch (mode) {
+    case ConnectMode::Wired:
+        // 强制有线：链路必须 Up；未知链路状态时先按 Up 走有线（由后续 EAP 失败兜底）
+        if (!ethernetLinkUp)
+            return { AuthBackend::None, QStringLiteral("已选择有线方式，但以太网网卡未检测到链路，请检查网线连接。") };
+        return { AuthBackend::WiredEap, QString() };
+
+    case ConnectMode::Wireless:
+        if (!ssidMatch(currentSsid, whitelist))
+            return { AuthBackend::None,
+                     currentSsid.isEmpty()
+                         ? QStringLiteral("已选择无线方式，但当前未连接到校园 Wi-Fi。")
+                         : QStringLiteral("已选择无线方式，但当前 SSID（%1）不在允许列表，请连接指定的校园 Wi-Fi。")
+                               .arg(currentSsid) };
+        return { AuthBackend::PortalWifi, QString() };
+
+    case ConnectMode::Auto:
+        break;
+    }
+    // Auto（及未来新增模式的默认）：有线优先，其次无线
+    if (ethernetLinkUp)
+        return { AuthBackend::WiredEap, QString() };
+    if (ssidMatch(currentSsid, whitelist))
+        return { AuthBackend::PortalWifi, QString() };
+    if (currentSsid.isEmpty())
+        return { AuthBackend::None, QStringLiteral("未检测到有线网络连接，也未连接到校园 Wi-Fi。") };
+    return { AuthBackend::None,
+             QStringLiteral("当前 SSID（%1）不在允许列表，连接 scut-student 后方可自动认证。").arg(currentSsid) };
+}
+
 } // namespace ConnectionBuilder
