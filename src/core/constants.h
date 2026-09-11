@@ -1,0 +1,303 @@
+#ifndef CONSTANTS_H
+#define CONSTANTS_H
+
+#include <array>
+#include <cstdint>
+
+// ============================================================================
+// 一、IEEE 802.1X / EAPOL 标准协议常量
+// ============================================================================
+
+// 802.1X 组播 MAC 地址 (IEEE Std 802.1X, Clause 8.13.2)
+constexpr std::array<uint8_t, 6> EAPOL_MULTICAST_MAC = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x03 };
+
+// 以太网帧类型: EAPOL (802.1X)
+constexpr uint16_t ETHERTYPE_EAPOL = 0x888E;
+
+// EAPOL 版本 (802.1X-2010 固定为 1)
+constexpr uint8_t EAPOL_VERSION = 0x01;
+
+// EAPOL 包类型 (IEEE 802.1X, Table 8-2)
+constexpr uint8_t EAPOL_TYPE_EAP_PACKET  = 0x00;  // EAP-Packet
+constexpr uint8_t EAPOL_TYPE_EAPOL_START = 0x01;  // EAPOL-Start
+constexpr uint8_t EAPOL_TYPE_EAPOL_LOGOFF = 0x02; // EAPOL-Logoff
+
+// EAP 代码 (RFC 3748, Section 4)
+constexpr uint8_t EAP_CODE_REQUEST  = 0x01;
+constexpr uint8_t EAP_CODE_RESPONSE = 0x02;
+constexpr uint8_t EAP_CODE_SUCCESS  = 0x03;
+constexpr uint8_t EAP_CODE_FAILURE  = 0x04;
+
+// EAP 类型 (RFC 3748 / IANA EAP Method Type Numbers)
+constexpr uint8_t EAP_TYPE_IDENTITY       = 0x01;  // Identity
+constexpr uint8_t EAP_TYPE_NOTIFICATION   = 0x02;  // Notification
+constexpr uint8_t EAP_TYPE_MD5_CHALLENGE  = 0x04;  // MD5-Challenge (EAP-MD5)
+
+// EAPOL 帧最小长度 (Eth 14 + EAPOL 4 + EAP 4 = 22)
+constexpr int EAPOL_MIN_FRAME_SIZE = 22;
+// EAP 头部偏移 (Eth 14 + EAPOL 4 = 18)
+constexpr int EAP_HEADER_OFFSET = 18;
+// EAP Payload 偏移 (Eth 14 + EAPOL 4 + EAP 4 + Type 1 = 23)
+constexpr int EAP_PAYLOAD_OFFSET = 23;
+
+// EAP-MD5 挑战值长度（RFC 3748 §5.4 规定恒为 16 字节）。长度不匹配的挑战帧不会
+// 算出正确摘要，回应它只是浪费一轮认证。
+constexpr int EAP_MD5_CHALLENGE_SIZE = 16;
+
+// 用户名（EAP Identity 载荷）字节上限。EAPOL/EAP 的长度字段均为 16 位，封包缓冲区
+// 按该长度分配——超过 65530 字节会回绕，导致 memcpy 越界写。253 字节是 802.1X
+// 实践中的可用上限（学号场景远小于此），超限在 ConnectionBuilder 阶段即拒绝。
+constexpr int EAP_MAX_USERNAME_BYTES = 253;
+
+
+// ============================================================================
+// 二、DrCOM 私有扩展 — Identity / MD5 Challenge 响应中的附加字段
+//    协议逆向自 Ruijie/H3C 校园网 DrCOM 认证
+// ============================================================================
+
+// Identity 响应 payload 尾部固定字段（5 字节）
+// 结构: {0x00, "Da", 0x00, 0x00}
+// 含义: 第一个0x00分割用户名; "Da"为DrCOM厂商标签; 后两个0x00为扩展标志位
+constexpr std::array<uint8_t, 5> DRCOM_IDENTITY_RESPONSE_SUFFIX = { 0x00, 0x44, 0x61, 0x00, 0x00 };
+
+// MD5-Challenge 响应 payload 中，MD5值+用户名之后的固定字段（5 字节）
+// 结构: {0x00, "Da", 0x2a, 0x00}
+constexpr std::array<uint8_t, 5> DRCOM_MD5_RESPONSE_SUFFIX = { 0x00, 0x44, 0x61, 0x2a, 0x00 };
+
+// ============================================================================
+// 三、DrCOM UDP 心跳/握手协议常量 — 逆向自 SCUT 校园网
+// ============================================================================
+
+// UDP 服务器端口
+constexpr uint16_t DRCOM_UDP_PORT = 61440;
+
+// UDP 心跳间隔 & 超时 (ms)
+constexpr int DRCOM_HEARTBEAT_INTERVAL = 30000;
+constexpr int DRCOM_HEARTBEAT_TIMEOUT  = 10000;
+
+// MiscInfo 发送失败重试（本机 MAC/IP 未就绪时的观测层重试；不影响认证流程）
+constexpr int DRCOM_MISC_INFO_RETRY_INTERVAL = 5000;   // 重试间隔 (ms)
+constexpr int DRCOM_MISC_INFO_MAX_RETRIES    = 3;      // 最大重试次数
+
+// 握手（MiscAlive → MiscResponseAlive → MiscInfo → MiscResponseInfo）在服务器不响应时的
+// 最大重试次数。超时看门狗到期后重发 MiscAlive，用尽即停止重发并记一条日志——本网络环境
+// DrCOM 服务器常不响应（见 SessionManager::onHeartbeatFailed），无限重发既无意义也刷屏。
+constexpr int DRCOM_HANDSHAKE_MAX_RETRIES    = 3;
+
+// UDP 包类型标记（第 0 字节）
+constexpr uint8_t DRCOM_UDP_MAGIC = 0x07;
+// Alive 包类型标记
+constexpr uint8_t DRCOM_ALIVE_MAGIC = 0xFF;
+
+// --- MiscAlive / MiscInfo 子类型 (data[4]) ---
+constexpr uint8_t DRCOM_SUBTYPE_MISC_ALIVE          = 0x01;  // 请求 alive
+constexpr uint8_t DRCOM_SUBTYPE_MISC_RESPONSE_ALIVE  = 0x02;  // 响应 alive → 发 MiscInfo
+constexpr uint8_t DRCOM_SUBTYPE_MISC_INFO            = 0x03;  // MiscInfo 包
+constexpr uint8_t DRCOM_SUBTYPE_MISC_RESPONSE_INFO   = 0x04;  // 响应 info → 解密信息 + 开始心跳
+constexpr uint8_t DRCOM_SUBTYPE_MISC_HEARTBEAT_ALIVE = 0x06;  // 心跳 alive 响应 → 发 heartbeat1
+constexpr uint8_t DRCOM_SUBTYPE_MISC_HEARTBEAT       = 0x0b;  // 心跳包
+
+// --- Heartbeat 子类型 (data[5]，仅当 data[4]==0x0b) ---
+// 客户端 → 服务器
+constexpr uint8_t DRCOM_HB_CLIENT_QUERY   = 0x01;  // 客户端心跳查询 (heartbeat1)
+constexpr uint8_t DRCOM_HB_CLIENT_CONFIRM = 0x03;  // 客户端心跳确认 (heartbeat3, 含 cks16+IP)
+// 服务器 → 客户端
+constexpr uint8_t DRCOM_HB_SUBTYPE_RESPONSE1 = 0x02;  // 响应 heartbeat1 → 发 heartbeat3
+constexpr uint8_t DRCOM_HB_SUBTYPE_ACK       = 0x04;  // 心跳周期完成 ACK
+
+// --- MiscInfo 包固定字段 ---
+constexpr uint16_t DRCOM_MISC_INFO_LENGTH = 0xF4;   // 244 字节
+constexpr uint8_t  DRCOM_MISC_INFO_FLAG   = 0x03;   // data[4]
+constexpr uint8_t  DRCOM_MISC_INFO_CMD    = 0x01;   // data[1] — 协议命令/版本标记
+
+// MiscInfo 中各段的偏移量
+constexpr int DRCOM_MISC_OFFSET_USERNAME_LEN  = 5;
+constexpr int DRCOM_MISC_OFFSET_SRC_MAC       = 6;
+constexpr int DRCOM_MISC_OFFSET_SRC_IP        = 12;
+constexpr int DRCOM_MISC_OFFSET_UNKNOWN1      = 16;
+constexpr int DRCOM_MISC_OFFSET_FLUX          = 20;
+constexpr int DRCOM_MISC_OFFSET_CKS32         = 24;
+constexpr int DRCOM_MISC_OFFSET_CKS32_TEMP    = 28;  // 校验计算时临时置 126
+constexpr int DRCOM_MISC_OFFSET_HOST_INFO     = 32;
+constexpr int DRCOM_MISC_HOST_INFO_SIZE       = 44;
+constexpr int DRCOM_MISC_OFFSET_DNS1          = 76;
+constexpr int DRCOM_MISC_OFFSET_DNS2          = 80;
+constexpr int DRCOM_MISC_OFFSET_UNKNOWN2      = 92;
+constexpr int DRCOM_MISC_OFFSET_OS_MAJOR      = 96;
+constexpr int DRCOM_MISC_OFFSET_OS_MINOR      = 100;
+constexpr int DRCOM_MISC_OFFSET_OS_BUILD      = 104;
+constexpr int DRCOM_MISC_OFFSET_OS_UNKNOWN    = 108;
+constexpr int DRCOM_MISC_OFFSET_VERSION       = 112;
+constexpr int DRCOM_MISC_VERSION_SIZE         = 64;
+constexpr int DRCOM_MISC_OFFSET_HASH          = 176;
+constexpr int DRCOM_MISC_HASH_SIZE            = 64;
+constexpr int DRCOM_MISC_MAX_USERNAME_LEN     = 25;
+
+// MiscInfo 固定字段值
+constexpr std::array<uint8_t, 4> DRCOM_MISC_UNKNOWN1  = { 0x02, 0x22, 0x00, 0x2a };
+constexpr std::array<uint8_t, 4> DRCOM_MISC_CKSPARAM  = { 0xc7, 0x2f, 0x31, 0x01 };  // cks32 初始种子
+constexpr std::array<uint8_t, 4> DRCOM_MISC_UNKNOWN2  = { 0x94, 0x00, 0x00, 0x00 };
+// 以下 OS 版本字段为 DrCOM 协议兼容的伪装值 (Windows 8 = 6.2.9200)。
+// 实际 OS 版本仅影响 MiscInfo 包内容，不影响认证流程；
+// 如需真实版本，可通过 RtlGetVersion 动态获取并填充。
+constexpr std::array<uint8_t, 4> DRCOM_MISC_OS_MAJOR  = { 0x06, 0x00, 0x00, 0x00 };
+constexpr std::array<uint8_t, 4> DRCOM_MISC_OS_MINOR  = { 0x02, 0x00, 0x00, 0x00 };
+constexpr std::array<uint8_t, 4> DRCOM_MISC_OS_BUILD  = { 0xf0, 0x23, 0x00, 0x00 };
+constexpr std::array<uint8_t, 4> DRCOM_MISC_OS_UNKNOWN = { 0x02, 0x00, 0x00, 0x00 };
+// DrCOM 客户端版本字符串 "DrCOM\0\x96\x02\x2a"
+constexpr std::array<uint8_t, 9> DRCOM_MISC_VERSION = { 0x44, 0x72, 0x43, 0x4f, 0x4d, 0x00, 0x96, 0x02, 0x2a };
+// 客户端哈希 (SHA1)
+constexpr char    DRCOM_MISC_HASH[]        = "4eb81fc048a5585b7dfe1783155241a328b103c6";
+constexpr size_t  DRCOM_MISC_HASH_LEN      = sizeof(DRCOM_MISC_HASH) - 1;  // 40 chars (excludes null)
+
+// cks32 计算相关常量
+constexpr uint8_t  DRCOM_CKS32_TEMP_VALUE  = 126;      // 偏移28临时填充值
+constexpr uint32_t DRCOM_CKS32_MULTIPLIER  = 19680126;  // 校验和乘数
+constexpr size_t   DRCOM_CKS32_LOOP_SIZE   = 244;       // cks32 遍历字节数
+constexpr uint32_t DRCOM_CKS16_MULTIPLIER  = 711;       // cks16 乘数
+constexpr size_t   DRCOM_CKS16_LOOP_SIZE   = 40;        // cks16 遍历字节数
+
+// --- Heartbeat 包固定字段 ---
+constexpr uint16_t DRCOM_HB_LENGTH     = 0x28;   // 40 字节
+constexpr uint8_t  DRCOM_HB_FLAG       = 0x0b;
+constexpr uint8_t  DRCOM_HB_FIXED1     = 0xdc;
+constexpr uint8_t  DRCOM_HB_FIXED2     = 0x02;
+
+// --- Alive 包结构大小 ---
+constexpr int DRCOM_ALIVE_MD5_SIZE    = 16;
+
+// --- MiscAlive 包 (8 字节) ---
+constexpr size_t DRCOM_MISC_ALIVE_SIZE = 8;
+
+// ============================================================================
+// 四、解密算法（DrCOM 私有加密）
+// ============================================================================
+
+// 校园网锐捷 DrCOM 私有加密/解密：按字节索引 i 进行循环左移 i%8 位
+// 加密 = 解密（对称），用于 MiscResponseInfo (subtype 0x04) 载荷的 16 字节加密块
+// 解密公式: decrypted[i] = (encrypted[i] << (i & 7)) | (encrypted[i] >> (8 - (i & 7)))
+
+// ============================================================================
+// 五、EAP 认证流程参数
+// ============================================================================
+
+// 认证超时 & 重发间隔 (ms)
+constexpr int EAP_RETRANSMIT_INTERVAL = 3000;
+// "等待交换机响应" 日志节流：每重发多少次才记录一条（默认每 5 次 ≈ 15s 一条）
+constexpr int RETRANSMIT_LOG_INTERVAL = 5;
+// pcap 收包超时 (ms) — 必须为 1ms，配合 20ms 轮询计时器使用
+constexpr int PCAP_READ_TIMEOUT = 1;
+
+// 单轮收包上限：工作线程持锁处理网络输入，必须设上限——否则异常/恶意洪泛会让
+// 锁长时间不释放，重发判定与状态信号全部停摆。余量留给下一轮 20ms 轮询 / readyRead。
+constexpr int EAP_MAX_PACKETS_PER_ROUND     = 64;   // EapProcess::drainPackets
+constexpr int DRCOM_MAX_DATAGRAMS_PER_ROUND = 64;   // UdpProcess::onReadyRead
+
+// ============================================================================
+// 六、默认网络配置
+// ============================================================================
+
+// SCUT 校园网 HTTP 重定向主机（认证前DNS劫持指向）
+constexpr const char* DEFAULT_HOST = "s.scut.edu.cn";
+// SCUT 校园网默认 DNS 服务器
+constexpr const char* DEFAULT_DNS = "202.38.193.33";
+
+// ============================================================================
+// 七、UI / 应用常量
+// ============================================================================
+
+// netsh 命令超时 (ms)
+constexpr int NETSH_TIMEOUT = 15000;
+// 自动联动（有线↔无线）执行前的链路稳定等待：插拔网线/端口就绪常有数百 ms 抖动，
+// 立即切换还会在链路上电前发出 802.1X 探测被拒（实测"认证被拒绝"）。
+// 5 秒（原为 3 秒）：链路检测改为接口变更通知后，计时起点从"轮询发现插入"（滞后
+// 插入 0~2 秒）变成"插入瞬间"——同样的 3 秒实际物理余量少了最多 2 秒，实测随即出现
+// "认证被拒绝"。此处回到与原先等效的余量；仍属现场可调参数。
+constexpr int CONNECT_SWITCH_DELAY_MS = 5000;
+
+// 链路检测节奏：主路径是系统接口变更通知（NotifyIpInterfaceChange，零轮询），
+// 轮询只在通知注册失败时作为唯一来源（LINK_POLL_INTERVAL_MS，即原行为），
+// 注册成功时退化为"漏事件保险"的低频复核（LINK_RESYNC_INTERVAL_MS）。
+constexpr int LINK_POLL_INTERVAL_MS   = 2000;
+constexpr int LINK_RESYNC_INTERVAL_MS = 20000;
+// 静态 IP 设置安全超时 (ms) — 超过此时间未完成则强制恢复状态
+constexpr int IP_SETUP_TIMEOUT = 30000;
+// 自动连接延迟 (ms)
+constexpr int AUTO_CONNECT_DELAY = 800;
+// 静默启动连接延迟 (ms)
+constexpr int SILENT_CONNECT_DELAY = 1000;
+// 自动连接失败后的重试 —— 登录早期网卡可能尚未就绪（Npcap 未枚举 / 静态IP的MAC未取到）
+constexpr int AUTO_CONNECT_RETRY_COUNT = 5;        // 未能启动连接时的后续重试次数
+constexpr int AUTO_CONNECT_RETRY_INTERVAL = 3000;  // 每次重试间隔 (ms)
+// 网卡清理等待 (ms)
+constexpr int PORT_CLEANUP_WAIT = 2000;
+// 静态 IP 设置后等待 (ms)
+constexpr int IP_SETTLE_WAIT = 1000;
+// PCAP 快照长度
+constexpr int PCAP_SNAPLEN = 1514;
+
+// 以太网头部字节数
+constexpr int ETH_HEADER_SIZE = 14;
+
+// ============================================================================
+// 八、无线 Portal 认证常量 — 逆向自 SCUT 无线校园网 Dr.COM WebLoginID 4.0
+//    （2026-09-03 实测闭环；协议细节见 docs/wifi_auth_logic.md——该文档不入库，
+//     随仓库外维护，新克隆者看不到）
+// ============================================================================
+
+// —— Dr.COM eportal 端点 ——
+constexpr int         EPORTAL_HTTP_PORT  = 801;      // 页面变量 epHTTPPort
+constexpr int         EPORTAL_HTTPS_PORT = 802;      // 页面变量 enHTTPSPort（enableHttps=1 时其生效）
+// 登录/登出端点（实测浏览器 F12 抓包，2026-09-03）：portal 入口为当前唯一可用路径
+constexpr const char* EPORTAL_LOGIN_PATH_PORTAL = "/eportal/portal/login";
+constexpr const char* EPORTAL_UNBIND_PATH       = "/eportal/portal/mac/unbind";  // 解绑下线（真注销）
+// 门户服务器默认主机名（候选第一名，用户更多用 s）。程序运行时以"发现的门户"为准：
+// 网关 302 或"哪个候选门户 online_list 认识本机会话"才决定真实域名；该默认值仅在
+// 尚未发现门户且未探测到在线会话时兜底。校园内网 DNS 私网解析（勿硬编码 IP）。
+constexpr const char* EPORTAL_DEFAULT_HOST = "s.scut.edu.cn";
+// 校区域门域名候选：各校区不同，网关 302 未出现（已认证放行/网关不指向门户）时，
+// 逐个用 online_list 探测——返回 result:1 且本机会话的那个即为当前 zone 的域名；
+// 全不命中则按默认登录，失败可重试时再换另一候选（见 WebAuthProcess::tryAlternateDomain）。
+inline constexpr std::array<const char*, 2> EPORTAL_HOST_CANDIDATES = {
+    "s.scut.edu.cn", "s2.scut.edu.cn"
+};
+constexpr const char* EPORTAL_LOADCONFIG_PATH   = "/eportal/portal/page/loadConfig";
+constexpr const char* EPORTAL_ONLINE_LIST_PATH  = "/eportal/portal/online_list";
+
+// 注：login 表单字段（DDDDD/upass/0MKKey=123456）属于已废弃的 /drcom/login 风格，
+// 协议知识仅存档于仓库外的 docs/wifi_auth_logic.md §5（eportal 登录参数为浏览器表单复制）。
+constexpr const char* EPORTAL_JS_VERSION = "4.1.3";        // jsVersion
+constexpr const char* EPORTAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/126.0.0.0 Safari/537.36";
+// 门户 page.name / program_index 默认值（a41.js 内嵌），loadConfig 可下发同名值
+constexpr const char* EPORTAL_PORTAL_NAME = "umqIDC1745977172";
+// 无线账号后缀（online_list 中的 user_account 形如 "<账号>@wifi"，登录可无后缀）
+constexpr const char* EPORTAL_ACCOUNT_SUFFIX = "@wifi";
+// online_list 查询的固定账号口令（user_account 由本机 IP/MAC 决定，不参与查询）
+constexpr const char* EPORTAL_PORTAL_LOGOUT_PASSWORD = "123";
+
+// —— 行为时序 (ms) ——
+constexpr int PORTAL_FETCH_TIMEOUT_MS         = 8000;   // 单次 HTTP 传输超时
+constexpr int PORTAL_LOGIN_TIMEOUT_MS         = 10000;  // 登录请求超时
+constexpr int PORTAL_MAX_REDIRECTS            = 6;      // 手动跟随重定向链上限
+constexpr int WIFI_RECHECK_INTERVAL_MS        = 60 * 1000;       // 在线期轮询间隔
+constexpr int WIFI_CONFIRM_TIMEOUT_MS         = 90 * 1000;       // 登录后等放行确认（实测可延迟 ~90s）
+constexpr int WIFI_LOGOUT_TIMEOUT_MS          = 10 * 1000;       // 登出确认等待（mac/unbind 传输超时）
+
+// 阶段细分时序（原本散落为进程内字面量，统一收口至此）
+constexpr int WIFI_GATEWAY_PROBE_TIMEOUT_MS   = 6000;   // 网关 302 探测超时（局域网内，瞬态）
+constexpr int WIFI_PRELOGIN_TIMEOUT_MS        = 3000;   // 登录前在线预检超时（失败视为未在线，不阻塞主流程）
+constexpr int WIFI_RETRY_DELAY_MS             = 1500;   // 门户页/配置抓取瞬态失败的重试间隔
+constexpr int WIFI_CONFIRM_POLL_MS            = 8000;   // online_list 上线确认轮询间隔
+
+// —— 门户入口页 ——
+// 入口页路径模板：真实入口由 AC 302 动态下发（各校区/AC 部署不同，禁止硬编码
+// 入口 host），此常量仅记录"302 后拼接 wlanacip 参数"的入口页形态
+constexpr const char* PORTAL_ENTRY_PATH       = "/a79.htm?wlanacip=";
+
+// —— 默认配置 ——
+constexpr const char* PORTAL_DEFAULT_MODE     = "auto";           // AppConfig.connectMode
+constexpr const char* PORTAL_DEFAULT_SSID     = "scut-student";   // AppConfig.wifiSsids
+
+#endif // CONSTANTS_H

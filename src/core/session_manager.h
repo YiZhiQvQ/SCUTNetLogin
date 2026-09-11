@@ -1,0 +1,226 @@
+#ifndef SESSION_MANAGER_H
+#define SESSION_MANAGER_H
+
+#include <QObject>
+#include <QStringList>
+#include <QThread>
+#include "core/protocol.h"
+#include "core/connection_builder.h"
+#include "eap/eap_process.h"
+#include "udp/udp_process.h"
+#include "network/network_worker.h"
+#include "wifi/webauth_process.h"
+
+class LogManager;
+namespace Network { class LinkMonitor; }   // 仅指针成员，前向声明即可（实现见 network.cpp）
+
+// ============================================================================
+// 应用连接状态机 — 负责整个连接流程的编排
+// ============================================================================
+
+enum class AppConnectionState {
+    Disconnected,
+    SettingNetwork,
+    Authenticating,
+    WiFiConnecting,     // 无线 Portal 认证（探测/登录/上线确认）
+    Connected
+};
+
+// 当前生效的接入后端（自动重连/唤醒/断线检测的分发依据）
+enum class ActiveBackend {
+    None,        // 无会话（auto 模式扫描态）
+    WiredEap,    // 有线 802.1X EAPOL + DrCOM UDP 心跳
+    PortalWifi   // 无线 DrCOM Web Portal
+};
+
+class SessionManager : public QObject {
+    Q_OBJECT
+
+public:
+    explicit SessionManager(QObject* parent = nullptr);
+    ~SessionManager() override;
+
+    AppConnectionState state() const { return m_state; }
+    // 当前生效后端（主线程只读；UI 状态文案"当前连接模式"用）
+    ActiveBackend activeBackend() const { return m_activeBackend; }
+
+    // ipCfg.adapterName 非空时先设置静态IP再认证；为空则直接认证
+    // mode/allowedSsids：联网方式与无线 SSID 白名单（无线模块，默认参数保持旧调用兼容）
+    void startConnection(const AuthConfig& config, const StaticIpConfig& ipCfg = {},
+                         ConnectMode mode = ConnectMode::Auto,
+                         const QStringList& allowedSsids = {});
+    // logoutWifi：true（用户点"断开"）= 无线同时注销；false（退出程序且未勾选退出登出）
+    // = 不注销无线连接，仅停止会话（DHCP 恢复/线程收尾照常）。
+    // userInitiated：true = 用户主动断开/退出（此后【不】自动就绪重连，直到再次手动连接）。
+    void stopConnection(bool logoutWifi = true, bool userInitiated = false);
+
+    // 开机自启（通过 Windows Task Scheduler）
+    void setAutoStart(bool enable);
+
+    // 调试输出开关：开启后 SessionManager 输出详细连接决策诊断，并转发给
+    // EAP/UDP/WiFi 工作进程输出各自帧级/阶段级追踪。立即生效（无需重启）。
+    void setDebugLogEnabled(bool on);
+
+    // DrCOM UDP 心跳保活开关（默认关闭）。关闭时不启动 UDP 线程/会话——有线认证只依赖
+    // 二层 802.1X，EAP 成功即已放行端口，UDP 心跳在 SCUT 现行网络上服务器不响应。
+    // 关闭方向立即生效；开启方向在下个连接周期（startAuth/onEapSuccess）生效。
+    void setDrcomHeartbeatEnabled(bool on);
+
+    // 系统从待机/睡眠唤醒时由 MainWindow（native event filter）调用：
+    // 睡眠期间 Qt 定时器基于单调时钟（部分电源状态下不走/不准），
+    // 重连排程（如"距 6:00 再试"）会被整体顺延；唤醒后用墙钟重新评估。
+    void onSystemResume();
+
+signals:
+    void stateChanged(AppConnectionState state);
+    void logMessage(const QString& message, int level);
+
+private slots:
+    void onEapStateChanged(AuthState state, const QString& message, bool retryable = true);
+    void onEapSuccess(const QByteArray& md5Data);
+    void onUdpOnline();
+    void onStaticIpDone(int gen);
+    void onStaticIpFailed(const QString& error, int gen);
+    void onDhcpDone(bool ok, const QString& error);
+    void onHeartbeatFailed();
+    void onReconnectTimeout();
+    void onAutoStartDone(bool ok, const QString& error);
+    // 无线 Portal 反馈
+    void onWifiStateChanged(WifiAuthState state, const QString& message, bool retryable = true);
+    void onWifiOnline();
+
+private:
+    void initProcesses();
+    void startAuth(bool restartEap = false);   // EAP 认证阶段（静态IP完成后调用）
+                                               // restartEap=true: 重连路径用原子的
+                                               // EapProcess::restart() 替代 stop+start
+    void startWiredBackend();                  // 有线完整流程：勾选静态IP→设置→认证（与
+                                               // startAuth 的区别：后者跳过网络配置阶段；
+                                               // 手动连接与链路切换共用此入口）
+    void startWifiAuth();                      // 无线 Portal 认证（刷新 IP/MAC/SSID + 启动进程）
+    void restoreDhcp();
+    void setState(AppConnectionState state);
+    // 向 UDP 工作进程投递 stop —— 仅在 UDP 线程确实在运行时投递。心跳开关关闭
+    // （默认）时该线程自始至终未启动，投递会留下一个永不执行的事件，等它某天被
+    // 真正拉起时会先于新会话的 start 执行（约定见 setDrcomHeartbeatEnabled）。
+    void stopUdpIfRunning();
+
+    // auto 模式下的链路联动监视（用户要求）：
+    //   事件源 = Network::LinkMonitor（系统接口变更通知）+ 低频兜底轮询，
+    //   见 ensureLinkMonitor / onLinkWatchTick
+    void startLinkWatch();
+    void stopLinkWatch();
+    void ensureLinkMonitor();
+    void onLinkWatchTick();
+
+    // auto 模式的后端决策（现场取链路/SSID，纯函数决定；非 const 因需要在
+    // 调试开启时输出决策依据诊断行）
+    ConnectionBuilder::BackendDecision decideBackend();
+
+    // 调试输出：仅 m_debugLog 时发射 logMessage，统一加 [调试] 前缀
+    void debugLog(const QString& message);
+    // 逐行输出多行适配器枚举（Network::dumpAdapters 结果拆行逐条 debugLog）
+    void logAdapterDump(const QString& dump);
+
+    // 无线 "Online" 回调的"仍应生效"守卫：仅当当前会话仍是无线后端且状态处于
+    // 连接中/已连接才接受（防止用户断开后滞后的 Online 信号把状态翻回 Connected）
+    bool isWifiUiLive() const;
+
+    // --- 自动重连调度 ---
+    void scheduleReconnect();
+    // 断开态就绪监听（解决"开机自启早于 Wi-Fi 连接"）：仅自动模式且用户未手动断开时
+    // 运行，每 2s 检查——有线插入→有线认证；否则匹配白名单 Wi-Fi 连上→无线认证。
+    // 触发认证后停止；认证失败重新进入监听。用户点连接恢复自动，点断开/退出停止。
+    void startAutoWait();
+    void stopAutoWait();
+    void onAutoWaitTick();
+    QTimer* m_autoWaitTimer = nullptr;
+    bool    m_autoWaitEnabled = false;   // 用户手动断开后置 false，直到下次手动连接恢复
+    // 认证失败后的统一处理：按时间段提示 + 进入 Disconnected + 调度重连
+    void scheduleNextRetry(const QString& nightMessage
+                           = QStringLiteral("认证失败，将在明早 6:00 自动重试"));
+    bool isNightWindow() const;            // 0:00-6:00 视为夜间，避免通宵刷屏
+    int  msecsToNextRetry() const;         // 夜间 → 距 6:00 毫秒数；白天 → 固定间隔
+    // 连续自动重试序号（仅用于日志区分；上线/手动连接/主动断开时清零）
+    int  m_retryAttempt = 0;
+
+    // 认证失败统一处理（onEapStateChanged / onWifiStateChanged 共用，行为逐字节一致）：
+    // retryable → 按时间段调度重连；否则停止自动重试并回 Disconnected
+    void handleAuthFailed(bool retryable,
+                          const QString& nightMessage = QStringLiteral("认证失败，将在明早 6:00 自动重试"));
+    // 链路切换挂机：注册"注销完成后切有线"并启动兜底定时器
+    void beginWiredSwitchAfterLogout();
+    void onWifiLogoutFinished();    // Stopped 确认路径（注销完成）
+    void onPostLogoutTimeout();     // 兜底路径（注销确认信号缺失）
+    // 工作进程 Stopped 的防御守卫（guardState = 该进程的"认证中"状态）：
+    // 仅当主状态机不在认证中时才允许回退 Disconnected
+    void handleWorkerStopped(AppConnectionState guardState);
+
+    // --- 线程 & 工作对象 ---
+    QThread         m_eapThread;
+    QThread         m_udpThread;
+    QThread         m_networkThread;
+    QThread         m_wifiThread;
+    EapProcess*     m_eapProcess     = nullptr;
+    UdpProcess*     m_udpProcess     = nullptr;
+    NetworkWorker*  m_networkWorker  = nullptr;
+    WebAuthProcess* m_webAuthProcess = nullptr;
+
+    // --- 状态 ---
+    AppConnectionState m_state = AppConnectionState::Disconnected;
+    AuthConfig     m_config;
+    StaticIpConfig m_ipCfg;
+    bool           m_wasStaticIpSet = false;
+    // 已投递但未收到 worker 回执的 DHCP 恢复请求。退出时据此判断"是否还需要
+    // 阻塞等一次恢复落地"（见 restoreDhcp / ~SessionManager）
+    bool           m_dhcpRestorePending = false;
+    // 静态IP设置代次：每次进入 SettingNetwork 递增；完成/失败/超时回调携代次校验，
+    // 防"上一轮 netsh 迟到完成后误触新一轮认证"（代数须随信号回传才有效，见 initProcesses）
+    int            m_ipSetupGeneration = 0;
+
+    // --- 无线模块 ---
+    ActiveBackend  m_activeBackend = ActiveBackend::None;
+    ConnectMode    m_connectMode   = ConnectMode::Auto;
+    QStringList    m_ssidWhitelist;
+    QTimer*        m_linkWatchTimer = nullptr;   // 兜底轮询（主路径是下面的接口变更通知）
+    Network::LinkMonitor* m_linkMonitor = nullptr;   // 接口变更通知（惰性创建，失败则保持空）
+    // 两个消费者各自的"运行中"开关。原先用"定时器是否在跑"隐式表达，引入接口变更
+    // 通知后该隐式语义失效——通知会绕过 stopXxx() 继续驱动处理函数，因此必须显式记录：
+    //   · 链路监视：切换期间必须暂停（stopLinkWatch 后不再被通知重新触发，否则会重复
+    //     打日志并叠加多个切换定时器）
+    //   · 就绪监听：失败退避期间必须停住（否则通知会让它立刻再认证一次，绕过
+    //     5 分钟/夜间 6:00 的重试节流）
+    bool           m_linkWatchRunning = false;
+    bool           m_autoWaitRunning  = false;
+    // auto 模式有线连续失败计数：≥2 次且无线可用时回退无线（防"插网线→切有线→失败→断网"；
+    // 有线认证成功或用户重新发起连接时清零）
+    int            m_wiredFailStreak = 0;
+
+    // 链路切换（插网线→有线）的挂机动作：等待无线注销（mac/unbind）完成后再
+    // 物理断开 Wi-Fi → 有线认证。注销完成由 Stopped 信号确认；缺失时靠兜底
+    // 定时器继续（任何新的人工连接/断开都会取消挂机）。
+    enum class PostLogoutAction { None, SwitchToWired };
+    PostLogoutAction m_postLogoutAction = PostLogoutAction::None;
+    QTimer*          m_postLogoutTimeout = nullptr;   // 注销确认兜底（WIFI_LOGOUT_TIMEOUT_MS+2s）
+    // 联动监视的上次有线链路状态（边缘检测：只在 插入/拔出 转变时打一行日志，
+    // 用于诊断"拔线无反应"——程序看到的链路状态与用户的真实操作是否一致）
+    bool           m_lastEthernetUp = false;
+
+    // --- 日志 ---
+    LogManager*    m_logManager = nullptr;
+    bool           m_debugLog   = false;   // 调试输出开关（见 setDebugLogEnabled）
+
+    // --- DrCOM UDP 心跳保活（默认关闭） ---
+    bool           m_drcomHeartbeat = false;  // 见 setDrcomHeartbeatEnabled
+
+    // --- 自动重连 ---
+    QTimer* m_reconnectTimer = nullptr;
+    static constexpr int kReconnectIntervalMs = 5 * 60 * 1000;  // 5 分钟
+
+    // 注意：本机网络的心跳超时【不】触发断连/重连。
+    // 校园网 DrCOM 服务器经常不回复 UDP 心跳包但网络仍正常，若按心跳超时判定断线
+    // 会导致网络被频繁误断。心跳仅用于维持会话，断线检测只依赖 EAP 层失败与
+    // 服务器主动踢线（EAP-Failure / 服务器通知），见 onHeartbeatFailed() 注释。
+};
+
+#endif // SESSION_MANAGER_H

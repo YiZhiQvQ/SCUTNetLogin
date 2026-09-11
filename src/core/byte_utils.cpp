@@ -1,0 +1,83 @@
+#include "core/byte_utils.h"
+
+namespace ByteUtils {
+
+namespace {
+// 12 位十六进制校验（仅允许 0-9 / A-F / a-f，分隔符已在上层剥离）
+bool isHex12(const QString& s)
+{
+    if (s.size() != 12)
+        return false;
+    for (const QChar& c : s) {
+        // 必须显式比较 ASCII 区间：QChar::isDigit() 对任意 Unicode 数字（如阿拉伯-印度
+        // 数字 '٣'）都返回真，会放行"看着像 12 位、实则非十六进制"的输入
+        if (c >= QLatin1Char('0') && c <= QLatin1Char('9'))
+            continue;
+        const QChar upper = c.toUpper();
+        if (upper < QLatin1Char('A') || upper > QLatin1Char('F'))
+            return false;
+    }
+    return true;
+}
+} // namespace
+
+void ipv4ToBytes(const QHostAddress& addr, uint8_t* out)
+{
+    const quint32 ipv4 = addr.toIPv4Address();
+    out[0] = (ipv4 >> 24) & 0xFF;
+    out[1] = (ipv4 >> 16) & 0xFF;
+    out[2] = (ipv4 >> 8) & 0xFF;
+    out[3] = ipv4 & 0xFF;
+}
+
+bool isMacZero(const uint8_t* mac)
+{
+    for (int i = 0; i < 6; ++i)
+        if (mac[i]) return false;
+    return true;
+}
+
+bool isIpZero(const uint8_t* ip)
+{
+    for (int i = 0; i < 4; ++i)
+        if (ip[i]) return false;
+    return true;
+}
+
+QString normalizeMac(const QString& mac)
+{
+    QString hex = mac.trimmed();
+    hex.remove(':');
+    hex.remove('-');
+    hex.remove('.');   // 支持 Cisco 风格 "0011.2233.4455"
+    // 校验长度与十六进制字符集：仅长度正确但含非 hex 字符（如 "GGGG..."）
+    // 时返回空，避免把非法 MAC 传给后面的适配器查找
+    if (!isHex12(hex))
+        return QString();
+    return hex.toUpper();
+}
+
+QString hexDump(const QByteArray& data, int maxBytes)
+{
+    const int n = data.size();
+    if (n == 0)
+        return QStringLiteral("(0 B)");
+
+    const bool truncate = (maxBytes > 0 && n > maxBytes);
+    const int shown = truncate ? maxBytes : n;
+
+    const QByteArray hex = data.left(shown).toHex().toUpper();
+    QString out;
+    for (int i = 0; i < hex.size(); i += 2) {
+        if (!out.isEmpty())
+            out += QLatin1Char(' ');
+        out += QLatin1Char(hex.at(i));
+        out += QLatin1Char(hex.at(i + 1));
+    }
+
+    out += truncate ? QStringLiteral(" ... (共 %1 B，显示前 %2 B)").arg(n).arg(shown)
+                    : QStringLiteral(" (%1 B)").arg(n);
+    return out;
+}
+
+} // namespace ByteUtils
