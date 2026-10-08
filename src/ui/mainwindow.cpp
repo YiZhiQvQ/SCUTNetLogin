@@ -167,10 +167,24 @@ MainWindow::MainWindow(QWidget* parent)
         updateHostFieldEnabled(on);
     });
     // 顺序：先读配置（此时网卡下拉为空，接口名由 loadInterfaces 完成后回填），
-    // 再后台枚举网卡——两者对控件的影响与"先同步枚举再读配置"一致
+    // 再按需后台枚举网卡——两者对控件的影响与"先同步枚举再读配置"一致。
+    // 【仅在勾选"启动后自动连接"时】启动即枚举：未勾选时用户明确不需要自动检测网卡，
+    // 改为惰性检测——首次切到「设置」页、点「刷新」或点「连接」时才枚举/自动填充。
+    // Wi-Fi 侧启动期本就无任何探测（WlanMedia 只在连接流程与"已连接"文案中调用）。
     loadConfig();
-    loadInterfaces();
-    autoDetectNetworkConfig();
+    if (ui->checkAutoConnect->isChecked()) {
+        loadInterfaces();
+        autoDetectNetworkConfig();
+    } else {
+        // 未勾选自动连接就不做网卡枚举：下拉保持为空，避免"启动即检测网卡"
+        onLogMessage(QStringLiteral("已关闭「启动后自动连接」：启动不自动检测网卡，"
+                                    "点击「刷新」或切到「设置」页即可检测"), 0);
+    }
+    // 惰性检测触发点：首次打开「设置」页（网卡下拉所在页）
+    connect(ui->tabWidget, &QTabWidget::currentChanged, this, [this](int index) {
+        if (index != 0 && !m_interfacesLoaded && !m_enumerationPending)
+            loadInterfaces();
+    });
     initSystemTray(appIcon);
 
     // 调试：启用的连接尝试基线（模式恒为自动；SSID 白名单/选中网卡/自动检测 IP 与 MAC）——
@@ -297,6 +311,9 @@ void MainWindow::setSilentStartup()
     // 语义 = 自动连接：静默启动总是发起自动连接，与"启动后自动连接"复选框无关。
     // 注意：构造函数可能已按复选框排了一次自动连接，这里排第二次——两次都走
     // triggerAutoConnect，由其开头的守卫保证只真正执行一次、也只打一条日志。
+    // 未勾选复选框时构造函数没枚举网卡，而自动连接需要网卡：这里补一次同步枚举请求。
+    if (!m_interfacesLoaded && !m_enumerationPending)
+        loadInterfaces();
     QTimer::singleShot(SILENT_CONNECT_DELAY, this, &MainWindow::triggerAutoConnect);
     // 静默启动（开机自启）不弹系统托盘消息：用户要求开机自启时避免打扰
 }
@@ -362,27 +379,43 @@ void MainWindow::onQuitApp()
 
 void MainWindow::loadInterfaces()
 {
-    // 后台枚举网卡（pcap_findalldevs 可能阻塞数百 ms；放在构造函数里会推迟窗口首帧）。
-    // 下拉此刻为空，因此 loadConfig 的"恢复选择"与脏检测基线都以空值落定——填充完成后
-    // 按配置里的设备名恢复选择、重算基线、再补自动探测，与"同步枚举后再 loadConfig"
-    // 的顺序等价（见 on_btnRefresh_clicked 复用的同一实现）。
-    const QString savedPcap = ConfigManager::load(ConfigManager::defaultPath()).interfaceName;
+    // 启动/惰性检测入口：优先用 config.ini 里保存的网卡名恢复下拉选择
+    enumerateInterfaces(m_savedInterfaceName, QString());
+}
+
+// 后台枚举网卡 -> 回主线程填充（prefer* 非空时按它们恢复下拉选择）。
+// pcap_findalldevs 可能阻塞数百 ms，故始终放线程池（放在构造函数里会推迟窗口首帧）。
+// 下拉原本为空，因此 loadConfig 的"恢复选择"与脏检测基线都以空值落定——填充完成后
+// 按配置/刷新前的选择恢复、重算基线、再补自动探测，与"同步枚举后再 loadConfig"
+// 的顺序等价（见 on_btnRefresh_clicked 复用的同一实现）。
+void MainWindow::enumerateInterfaces(const QString& preferPcap, const QString& preferText)
+{
+    if (m_enumerationPending)
+        return;   // 已有一次枚举在途：完成后统一处理续接（见 m_connectAfterEnumeration）
+    m_enumerationPending = true;
 
     QPointer<MainWindow> guard(this);
-    QThreadPool::globalInstance()->start(QRunnable::create([guard, savedPcap]() {
+    QThreadPool::globalInstance()->start(QRunnable::create([guard, preferPcap, preferText]() {
         const auto interfaces = Network::listInterfaces();
         QMetaObject::invokeMethod(QCoreApplication::instance(),
-                                  [guard, interfaces, savedPcap]() {
+                                  [guard, interfaces, preferPcap, preferText]() {
             if (!guard)
                 return;
+            guard->m_enumerationPending = false;
+            guard->m_interfacesLoaded = true;
             {
                 // 抑制填充过程中的 currentIndexChanged（否则会对逐个条目触发自动探测）
                 QSignalBlocker blocker(guard->ui->comboInterface);
-                guard->populateInterfaces(interfaces, savedPcap, QString());
+                guard->populateInterfaces(interfaces, preferPcap, preferText);
             }
             // 下拉首次有值：重算脏检测基线（loadConfig 那次拿到的是空网卡名）
             guard->m_lastSavedConfig = guard->collectCurrentCfg();
             guard->autoDetectNetworkConfig();
+            // 用户在枚举完成前点了"连接"：现在续接同一次连接请求
+            if (guard->m_connectAfterEnumeration) {
+                guard->m_connectAfterEnumeration = false;
+                guard->connectWithCurrentInput();
+            }
         }, Qt::QueuedConnection);
     }));
 }
@@ -481,6 +514,9 @@ void MainWindow::on_btnQueryMac_clicked()
 void MainWindow::loadConfig()
 {
     AppConfig cfg = ConfigManager::load(ConfigManager::defaultPath());
+    // 记住保存的网卡名：未勾选"启动后自动连接"时启动不枚举网卡，下拉为空；此值用于
+    // 枚举完成后恢复选择（enumerateInterfaces 的 preferPcap）
+    m_savedInterfaceName = cfg.interfaceName;
 
     ui->editUsername->setText(cfg.username);
     // 双向同步：只在 true 时 setChecked 会留下 .ui 的默认勾选（checked=true）——配置为
@@ -590,7 +626,9 @@ void MainWindow::on_btnConnect_clicked()
 {
     if (m_sessionManager->state() != AppConnectionState::Disconnected) {
         // 连接中按钮已禁用，但 Ctrl+Enter 快捷键仍可达——给出明确提示
-        onLogMessage(QStringLiteral("当前已在连接流程中，请先点「断开」再连接"), 1);
+        onLogMessage(m_sessionManager->state() == AppConnectionState::WaitingForNetwork
+                         ? QStringLiteral("当前正在等待网络，请先点「取消」结束等待再连接")
+                         : QStringLiteral("当前已在连接流程中，请先点「断开」再连接"), 1);
         return;
     }
     connectWithCurrentInput();
@@ -600,8 +638,19 @@ void MainWindow::on_btnConnect_clicked()
 // 模式切换功能已按用户要求移除：有线/无线由链路状态自动决定，意图不会被误读。
 void MainWindow::connectWithCurrentInput()
 {
+    // 未勾选"启动后自动连接"时启动不枚举网卡：首次点"连接"先补一次枚举，
+    // 枚举完成后自动续接本次连接（见 enumerateInterfaces 的完成回调）。
+    // 期间按"等待"展示（亮「取消」）——取消后不再续接（见 on_btnDisconnect_clicked）
+    if (!m_interfacesLoaded) {
+        onLogMessage(QStringLiteral("正在检测网卡，检测完成后将自动继续连接..."), 0);
+        m_connectAfterEnumeration = true;
+        applyStateUI(AppConnectionState::WaitingForNetwork);
+        loadInterfaces();
+        return;
+    }
     if (ui->comboInterface->count() == 0) {
         onLogMessage(QStringLiteral("未检测到可用网卡，请点击刷新重试"), 2);
+        applyStateUI(m_sessionManager->state());   // 结束"等待网卡"展示（若正处于其中）
         return;
     }
 
@@ -611,15 +660,25 @@ void MainWindow::connectWithCurrentInput()
     in.displayText    = ui->comboInterface->currentText();
     in.username       = ui->editUsername->text();
     in.password       = ui->editPassword->text();
-    // 静态 IP 仅在【插了网线的有线场景】适用：无线 Portal 基于 DHCP，忽略静态 IP
-    // （startConnection 的 PortalWifi 分支同样忽略）。否则未插网线点连接会因取不到
-    // 网卡 MAC 而误报"静态IP配置失败"，并让自动连接循环把"MAC为空"当"未就绪"刷屏。
-    const bool wiredPlugged = Network::ethernetLinkUp();
-    in.autoSetNetwork = ui->checkAutoSetNetwork->isChecked() && wiredPlugged;
-    // MAC 由用户点击「查询」或手动填写：不再自动获取（静态 IP 未填 MAC 时 build 会提示）
-    in.mac            = ui->editMac->text().trimmed();
-    if (in.autoSetNetwork)
+    // 静态 IP 是"意图"，不再与"点击连接这一刻是否插着网线"耦合：先启动后插网线时，
+    // 点击连接时还没插线，但真正的有线认证发生在插线之后——旧实现用 wiredPlugged
+    // 把静态 IP 在这条路径上丢掉，导致"第一次自动有线认证固定失败，手动再连一次就好"
+    // （用户报告的问题 3）。是否真的要配置静态 IP、以及配置到哪块网卡，由
+    // SessionManager 在认证时刻决定（无线后端本就不读 ipCfg）。
+    in.autoSetNetwork = ui->checkAutoSetNetwork->isChecked();
+    // MAC 由用户点击「查询」或手动填写；为空时按需从当前选中网卡补一次（不需要插线，
+    // 只是给静态 IP 的 netsh 目标用；仍取不到则由 build 给出软提示，见 ConnectionBuilder）
+    in.mac = ui->editMac->text().trimmed();
+    if (in.autoSetNetwork) {
+        if (in.mac.isEmpty()) {
+            const QNetworkInterface iface = Network::findInterface(in.pcapName, in.displayText);
+            if (iface.isValid() && !iface.hardwareAddress().isEmpty()) {
+                in.mac = iface.hardwareAddress();
+                ui->editMac->setText(in.mac);
+            }
+        }
         in.adapterName = Network::adapterNameByMac(in.mac);
+    }
     in.ip      = ui->editIp->text().trimmed();
     in.mask    = ui->editMask->text().trimmed();
     in.gateway = ui->editGateway->text().trimmed();
@@ -631,21 +690,19 @@ void MainWindow::connectWithCurrentInput()
     ConnectionBuilder::Result r = ConnectionBuilder::build(in);
     if (!r.ok) {
         onLogMessage(r.error, 2);
+        applyStateUI(m_sessionManager->state());   // 结束"等待网卡"展示（若正处于其中）
         return;
     }
+    if (!r.warning.isEmpty())
+        onLogMessage(r.warning, 1);
 
     saveConfig();
     ui->textLog->clear();
 
     AuthConfig config = getCurrentConfig();
     const QStringList ssids = ConnectionBuilder::parseSsidList(in.ssidRaw);
-    if (r.needStaticIp) {
-        ui->btnDisconnect->setEnabled(false);
-        m_actionDisconnect->setEnabled(false);
-        m_sessionManager->startConnection(config, r.ipConfig, ConnectMode::Auto, ssids);
-    } else {
-        m_sessionManager->startConnection(config, {}, ConnectMode::Auto, ssids);
-    }
+    m_sessionManager->startConnection(config, r.needStaticIp ? r.ipConfig : StaticIpConfig{},
+                                      ConnectMode::Auto, ssids);
 }
 
 // ============================================================================
@@ -659,6 +716,10 @@ void MainWindow::autoConnectWithRetry(int attempt)
         m_autoConnectPending = false;
         return;
     }
+
+    // 用户已点「取消」（cancelPendingAutoConnect）：本链作废，迟到的单发回调直接结束
+    if (!m_autoConnectPending)
+        return;
 
     // 已在连接中（用户已手动连接，或某次尝试已启动成功）——整个流程结束
     if (m_sessionManager->state() != AppConnectionState::Disconnected) {
@@ -675,11 +736,16 @@ void MainWindow::autoConnectWithRetry(int attempt)
             onLogMessage(QStringLiteral("自动连接失败：网卡在约 %1 秒内未就绪，已放弃。请点击\"连接\"或\"刷新网卡\"手动重试。")
                              .arg(AUTO_CONNECT_RETRY_COUNT * AUTO_CONNECT_RETRY_INTERVAL / 1000), 1);
             m_autoConnectPending = false;
+            applyStateUI(m_sessionManager->state());   // 结束等待态展示（恢复连接按钮）
             return;
         }
         onLogMessage(QStringLiteral("网络尚未就绪，%1 秒后自动重试 (%2/%3) ...")
                          .arg(AUTO_CONNECT_RETRY_INTERVAL / 1000)
                          .arg(attempt + 1).arg(AUTO_CONNECT_RETRY_COUNT), 0);
+        // 等待期展示"等待中"并亮「取消」按钮（用户要求所有等待阶段都可取消）：
+        // 这是 MainWindow 自己的就绪重试链，SessionManager 尚未启动会话，故直接以
+        // 等待态文案渲染一次（纯展示，不改 SessionManager 状态）
+        applyStateUI(AppConnectionState::WaitingForNetwork);
         // 继续本链：m_autoConnectPending 保持 true，阻止另一个入口开新链
         QTimer::singleShot(AUTO_CONNECT_RETRY_INTERVAL, this, [this, attempt]() {
             autoConnectWithRetry(attempt + 1);
@@ -694,8 +760,29 @@ void MainWindow::autoConnectWithRetry(int attempt)
     on_btnConnect_clicked();
 }
 
+// 取消"启动期自动连接重试链"（等待网卡就绪的那条链）：清标志、复位等待态展示。
+void MainWindow::cancelPendingAutoConnect()
+{
+    if (!m_autoConnectPending)
+        return;
+    m_autoConnectPending = false;
+    onLogMessage(QStringLiteral("已取消自动连接等待"), 0);
+    applyStateUI(m_sessionManager->state());   // 复位为"未连接"（连接按钮恢复可用）
+}
+
 void MainWindow::on_btnDisconnect_clicked()
 {
+    // 等待态（等待网线/校园 Wi-Fi、认证失败后的重试等待）里本按钮显示为「取消」：
+    // 取消等待 = 结束重试排程/就绪监听并回到未连接，不再自动连接（直到用户再点连接）
+    cancelPendingAutoConnect();
+
+    // 手动点"连接"后正在等待网卡枚举：取消这次续接（枚举完成回调见 enumerateInterfaces）
+    if (m_connectAfterEnumeration) {
+        m_connectAfterEnumeration = false;
+        onLogMessage(QStringLiteral("已取消连接等待"), 0);
+        applyStateUI(m_sessionManager->state());
+    }
+
     if (m_sessionManager->state() == AppConnectionState::Disconnected)
         return;
 
@@ -714,41 +801,55 @@ void MainWindow::applyStateUI(AppConnectionState state)
         QString traySuffix;
         QString styleProp;
         bool connected;   // true = 连接流程进行中：禁用连接按钮、启用断开按钮
+        // 等待态展示：断开按钮改文案为「取消」（点击即结束等待，而非断开会话）。
+        // 空串 = 保持默认「断开」。
+        QString cancelButtonText;
     };
 
     static const StateInfo kDisconnected = {
         QStringLiteral("未连接"), QStringLiteral("点击下方按钮开始认证"),
-        QStringLiteral(" (未连接)"), QStringLiteral("disconnected"), false };
+        QStringLiteral(" (未连接)"), QStringLiteral("disconnected"), false, QString() };
+    // 等待网络/等待重试：可取消的等待（用户要求所有等待阶段都亮「取消」按钮）
+    static const StateInfo kWaitingForNetwork = {
+        QStringLiteral("等待网络..."),
+        QStringLiteral("正在等待网线插入或校园 Wi-Fi 连接，将自动认证（点「取消」结束等待）"),
+        QStringLiteral(" (等待网络...)"), QStringLiteral("connecting"), true,
+        QStringLiteral("取消") };
     static const StateInfo kSettingNetwork = {
         QStringLiteral("正在配置网络..."), QStringLiteral("正在设置静态IP及DNS"),
-        QStringLiteral(" (配置网络中...)"), QStringLiteral("connecting"), true };
+        QStringLiteral(" (配置网络中...)"), QStringLiteral("connecting"), true, QString() };
     static const StateInfo kAuthenticating = {
         QStringLiteral("正在认证..."), QStringLiteral("正在发送802.1X认证包"),
-        QStringLiteral(" (认证中...)"), QStringLiteral("connecting"), true };
+        QStringLiteral(" (认证中...)"), QStringLiteral("connecting"), true, QString() };
     static const StateInfo kConnected = {
         QStringLiteral("已连接"), QStringLiteral("校园网已连接，可以上网"),
-        QStringLiteral(" (已连接)"), QStringLiteral("connected"), true };
+        QStringLiteral(" (已连接)"), QStringLiteral("connected"), true, QString() };
     // 无线 Portal 认证中（探测/门户/登录/上线确认——细化文案来自日志）
     static const StateInfo kWiFiConnecting = {
         QStringLiteral("正在认证..."), QStringLiteral("正在连接无线校园网（门户认证）"),
-        QStringLiteral(" (无线认证中...)"), QStringLiteral("connecting"), true };
+        QStringLiteral(" (无线认证中...)"), QStringLiteral("connecting"), true, QString() };
 
     const StateInfo* info = nullptr;
     switch (state) {
-    case AppConnectionState::Disconnected:   info = &kDisconnected;   break;
-    case AppConnectionState::SettingNetwork: info = &kSettingNetwork; break;
-    case AppConnectionState::Authenticating: info = &kAuthenticating; break;
-    case AppConnectionState::WiFiConnecting: info = &kWiFiConnecting; break;
-    case AppConnectionState::Connected:      info = &kConnected;      break;
+    case AppConnectionState::Disconnected:     info = &kDisconnected;     break;
+    case AppConnectionState::WaitingForNetwork: info = &kWaitingForNetwork; break;
+    case AppConnectionState::SettingNetwork:   info = &kSettingNetwork;   break;
+    case AppConnectionState::Authenticating:   info = &kAuthenticating;   break;
+    case AppConnectionState::WiFiConnecting:   info = &kWiFiConnecting;   break;
+    case AppConnectionState::Connected:        info = &kConnected;        break;
     default:
         return;  // 防御：枚举越界直接忽略（状态由 SessionManager 内部状态机产生）
     }
 
-    // 按钮状态
+    // 按钮状态（等待态：连接禁用、断开=「取消」可用）
     ui->btnConnect->setEnabled(!info->connected);
     ui->btnDisconnect->setEnabled(info->connected);
     m_actionConnect->setEnabled(!info->connected);
     m_actionDisconnect->setEnabled(info->connected);
+    const bool cancelMode = !info->cancelButtonText.isEmpty();
+    const QString disconnectText = cancelMode ? info->cancelButtonText : QStringLiteral("断开");
+    ui->btnDisconnect->setText(disconnectText);
+    m_actionDisconnect->setText(cancelMode ? QStringLiteral("取消等待") : QStringLiteral("断开"));
 
     // 标签
     ui->label_status->setText(info->text);
@@ -761,7 +862,7 @@ void MainWindow::applyStateUI(AppConnectionState state)
     ui->label_status->style()->unpolish(ui->label_status);
     ui->label_status->style()->polish(ui->label_status);
 
-    // 自绘状态指示器（连接中带旋转动画）
+    // 自绘状态指示器（连接中带旋转动画；等待态保持灰环，不转）
     updateStatusIcon(state);
 }
 
@@ -799,6 +900,10 @@ void MainWindow::updateConnectModeLabel(AppConnectionState state)
     case AppConnectionState::Disconnected:
         mode = QStringLiteral("未连接");
         break;
+    case AppConnectionState::WaitingForNetwork:
+        // 等待期后端尚未定（会话未开始），显示"等待网络"而不是误报"有线"
+        mode = QStringLiteral("等待网络");
+        break;
     default:
         // SettingNetwork / Authenticating / WiFiConnecting：后端已定，直接按后端显示
         mode = (m_sessionManager->activeBackend() == ActiveBackend::PortalWifi)
@@ -831,20 +936,10 @@ void MainWindow::onLogMessage(const QString& message, int level)
 
 void MainWindow::on_btnRefresh_clicked()
 {
-    // 后台枚举网卡（pcap_findalldevs 可能阻塞数百 ms），完成后回主线程填充。
-    // QPointer 守卫：窗口销毁后回调安全失效。
-    QPointer<MainWindow> guard(this);
-    const QString preferPcap = ui->comboInterface->currentData().toString();
-    const QString preferText = ui->comboInterface->currentText();
-
-    QThreadPool::globalInstance()->start(QRunnable::create([guard, preferPcap, preferText]() {
-        const auto interfaces = Network::listInterfaces();
-        QMetaObject::invokeMethod(QCoreApplication::instance(),
-                                  [guard, interfaces, preferPcap, preferText]() {
-            if (guard)
-                guard->populateInterfaces(interfaces, preferPcap, preferText);
-        }, Qt::QueuedConnection);
-    }));
+    // 刷新：保留刷新前的选择（同一实现见 enumerateInterfaces；QPointer 守卫保证窗口
+    // 销毁后回调安全失效）
+    enumerateInterfaces(ui->comboInterface->currentData().toString(),
+                        ui->comboInterface->currentText());
 }
 
 void MainWindow::on_btnSaveConfig_clicked()

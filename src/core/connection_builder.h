@@ -10,10 +10,15 @@
 //
 // 负责"点击连接"时的校验与组装：
 //   1. 回环网卡拒绝
-//   2. MAC 可用性检查
-//   3. netsh 适配器名非空检查（适配器名由调用方用 Network::adapterNameByMac 预解析）
-//   4. 静态 IP 字段完整性校验
-//   5. StaticIpConfig 组装
+//   2. 静态 IP 字段完整性校验
+//   3. StaticIpConfig 组装（静态 IP "意图"：adapterName 允许为空）
+//
+// 【不要】在此处把"此刻能否定位网卡（MAC/适配器名）"当作硬错误：点击连接时
+// 可能还没插网线、网卡也尚未获得 IPv4，而真正的有线认证发生在（可能几分钟后的）
+// 插线时刻。硬错误会让"等待网线插入"整条路径无法进入，或让认证在缺少静态 IP
+// 的情况下必然失败（用户报告：先启动后插网线，第一次有线认证固定失败）。
+// 适配器/本机 IP 的解析下沉到 SessionManager 的认证时刻（startWiredBackend），
+// 解析不到时告警并跳过静态 IP，而不是否决连接。
 //
 // 所有 UI 读写（编辑框、下拉框、按钮禁用）仍留在 MainWindow 槽中；本模块
 // 不含 pcap / Qt Widgets / Network 依赖，可被单元测试直接编译。
@@ -44,6 +49,9 @@ struct Input {
 struct Result {
     bool ok = false;
     QString error;
+    // 非致命提示（ok=true 时有意义）：如"静态 IP 已启用但尚未定位到网卡"。
+    // 由调用方以告警级别打印；认证时刻 SessionManager 会再尝试解析适配器。
+    QString warning;
     bool needStaticIp = false;
     StaticIpConfig ipConfig;     // 仅 needStaticIp 时有效
 };

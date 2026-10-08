@@ -576,19 +576,25 @@ void TestPackets::build_credentialValidation()
 
 void TestPackets::build_staticIpValidation()
 {
-    // MAC 为空
+    // MAC 为空：软提示（不再否决连接）——点击连接时可能还没插网线/未枚举网卡，
+    // 静态 IP 的 netsh 目标由 SessionManager 在认证时刻解析
     auto in = makeConnectInput();
     in.mac.clear();
     auto r = ConnectionBuilder::build(in);
-    QVERIFY(!r.ok);
-    QVERIFY(r.error.contains(QStringLiteral("MAC")));
+    QVERIFY(r.ok);
+    QVERIFY(r.needStaticIp);
+    QVERIFY(!r.warning.isEmpty());
+    QVERIFY(r.warning.contains(QStringLiteral("MAC")));
 
-    // 适配器名未解析到
+    // 适配器名未解析到：同样只给软提示
     in = makeConnectInput();
     in.adapterName.clear();
     r = ConnectionBuilder::build(in);
-    QVERIFY(!r.ok);
-    QVERIFY(r.error.contains(QStringLiteral("适配器")));
+    QVERIFY(r.ok);
+    QVERIFY(r.needStaticIp);
+    QVERIFY(!r.warning.isEmpty());
+    QVERIFY(r.warning.contains(QStringLiteral("适配器")));
+    QVERIFY(r.ipConfig.adapterName.isEmpty());   // 交给认证时刻再解析
 
     // 缺少字段（只缺 IP 与网关，掩码/DNS 完整 → 报错中只含所缺项）
     in = makeConnectInput();
@@ -1138,19 +1144,25 @@ void TestPackets::portalParser_buildOnlineListUrl()
 void TestPackets::retryPolicy_nightWindowAndDelay()
 {
     const QDate d(2026, 9, 10);
-    // 夜间窗口 = 0:00:00 ~ 05:59:59（校园网该时段拒绝登录）
+    // 夜间窗口 = 0:00:00 ~ 06:00:59（校园网该时段拒绝登录；6:00 整点仍会被拒，
+    // 故排程到 6:01）
     QVERIFY(RetryPolicy::isNightWindow(QDateTime(d, QTime(0, 0))));
     QVERIFY(RetryPolicy::isNightWindow(QDateTime(d, QTime(5, 59, 59))));
-    QVERIFY(!RetryPolicy::isNightWindow(QDateTime(d, QTime(6, 0))));
+    QVERIFY(RetryPolicy::isNightWindow(QDateTime(d, QTime(6, 0))));
+    QVERIFY(RetryPolicy::isNightWindow(QDateTime(d, QTime(6, 0, 59))));
+    QVERIFY(!RetryPolicy::isNightWindow(QDateTime(d, QTime(6, 1))));
     QVERIFY(!RetryPolicy::isNightWindow(QDateTime(d, QTime(23, 59))));
 
     // 白天：固定间隔
     QCOMPARE(RetryPolicy::nextRetryDelayMs(QDateTime(d, QTime(12, 0)), 300000), 300000);
-    // 23:59 仍属白天（0:00 才断网）：给固定间隔，而不是"等到次日 6:00"
+    // 23:59 仍属白天（0:00 才断网）：给固定间隔，而不是"等到次日 6:01"
     QCOMPARE(RetryPolicy::nextRetryDelayMs(QDateTime(d, QTime(23, 59)), 300000), 300000);
-    // 夜间：等到当日 6:00（避免通宵每 5 分钟重试一次）
-    QCOMPARE(RetryPolicy::nextRetryDelayMs(QDateTime(d, QTime(5, 0)), 300000), 3600000);
-    QCOMPARE(RetryPolicy::nextRetryDelayMs(QDateTime(d, QTime(0, 0)), 300000), 6 * 3600 * 1000);
+    // 夜间：等到当日 6:01（避免通宵每 5 分钟重试一次）
+    QCOMPARE(RetryPolicy::nextRetryDelayMs(QDateTime(d, QTime(5, 0)), 300000), 61 * 60 * 1000);
+    QCOMPARE(RetryPolicy::nextRetryDelayMs(QDateTime(d, QTime(0, 0)), 300000),
+             (6 * 3600 + 60) * 1000);
+    // 6:00 整点（旧实现的重试目标）仍属夜间：继续等到 6:01
+    QCOMPARE(RetryPolicy::nextRetryDelayMs(QDateTime(d, QTime(6, 0)), 300000), 60 * 1000);
 }
 
 void TestPackets::retryPolicy_wifiFallback()

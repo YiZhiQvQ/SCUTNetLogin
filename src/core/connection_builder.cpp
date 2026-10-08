@@ -52,14 +52,15 @@ Result build(const Input& in)
     }
 
     // 3. 静态 IP 配置分支
+    //    注意：MAC / 适配器名解析失败**不是**硬错误——点击连接时可能还没插网线，
+    //    真正的有线认证在插线时刻发生。这里只校验用户填写的静态 IP 参数，适配器
+    //    由 SessionManager 在认证时刻解析（失败则告警并跳过配置静态 IP）。
     if (in.autoSetNetwork) {
         if (in.mac.isEmpty()) {
-            r.error = QStringLiteral("无法获取网卡MAC地址，静态IP配置失败。请手动填写MAC地址或取消静态IP配置。");
-            return r;
-        }
-        if (in.adapterName.isEmpty()) {
-            r.error = QStringLiteral("未找到MAC地址 %1 对应的网络适配器，无法配置静态IP。").arg(in.mac);
-            return r;
+            r.warning = QStringLiteral("尚未取到网卡 MAC 地址，静态 IP 将在插上网线后按当前选中的网卡配置。");
+        } else if (in.adapterName.isEmpty()) {
+            r.warning = QStringLiteral("未找到 MAC 地址 %1 对应的网络适配器，将在认证时刻按当前选中的网卡重试解析。")
+                            .arg(in.mac);
         }
 
         QStringList missing;

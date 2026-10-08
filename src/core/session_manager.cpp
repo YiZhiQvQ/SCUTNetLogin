@@ -31,11 +31,16 @@ SessionManager::~SessionManager()
     // 校园网后无法上网。用 BlockingQueuedConnection 确保恢复完成后再退出：
     // 阻塞调用排在已投递的异步恢复之后执行，返回即代表"恢复已落地"
     // （setDhcp 幂等，重复执行无副作用）。
-    if (!m_ipCfg.adapterName.isEmpty() && (m_wasStaticIpSet || m_dhcpRestorePending)) {
+    // 目标网卡取 m_staticIpAdapter（与 m_ipCfg 分离，见头文件）：若中途换过网卡配置，
+    // 只认"真正被写过静态 IP 的那块"，否则会恢复错网卡、旧网卡永久残留。
+    const QString dhcpAdapter = !m_staticIpAdapter.isEmpty() ? m_staticIpAdapter
+                                                             : m_ipCfg.adapterName;
+    if (!dhcpAdapter.isEmpty() && (m_wasStaticIpSet || m_dhcpRestorePending)) {
         QMetaObject::invokeMethod(m_networkWorker, "doSetDhcp", Qt::BlockingQueuedConnection,
-                                  Q_ARG(QString, m_ipCfg.adapterName));
+                                  Q_ARG(QString, dhcpAdapter));
         m_wasStaticIpSet = false;
         m_dhcpRestorePending = false;
+        m_staticIpAdapter.clear();
     }
 
     QMetaObject::invokeMethod(m_eapProcess, "stop", Qt::QueuedConnection);
@@ -86,7 +91,7 @@ void SessionManager::initProcesses()
     connect(m_eapProcess, &EapProcess::sleepRequired, this, [this]() {
         QMetaObject::invokeMethod(m_eapProcess, "stop", Qt::QueuedConnection);
         stopUdpIfRunning();
-        scheduleNextRetry(QStringLiteral("当前时段禁止上网，将在明早 6:00 自动重试"));
+        scheduleNextRetry(QStringLiteral("当前时段禁止上网，将在明早 6:01 自动重试"));
     });
 
     // -- UDP 心跳线程 --
@@ -168,7 +173,11 @@ void SessionManager::startConnection(const AuthConfig& config, const StaticIpCon
         // 校园 Wi-Fi 连上（就绪监听）再自动认证；reason 仅留诊断
         qWarning().noquote() << "auth backend undecided:" << decision.reason;
         emit logMessage(QStringLiteral("等待网络就绪：插入网线或连接校园 Wi-Fi 后将自动认证..."), 0);
-        setState(AppConnectionState::Disconnected);
+        // 放弃本轮有线意图：若上一会话的静态 IP 还留在网卡上，先恢复 DHCP（用户要求：
+        // 有线连不上时必须把机器还给 DHCP，而不是留在静态 IP 上）
+        restoreDhcp();
+        // 状态由 startAutoWait() 置为 WaitingForNetwork（UI 亮「取消」），不要在此
+        // setState(Disconnected)——那会让界面显示"未连接"从而亮出"连接"按钮
         // auto 模式：既定时重扫（5 分钟兜底），更即时地监听有线路由/匹配 Wi-Fi 就绪即触发认证
         scheduleReconnect();
         startAutoWait();
@@ -200,9 +209,40 @@ void SessionManager::startWiredBackend()
     //   · startLinkWatch 的"拔网线→断开"分支（None 走 stopLinkWatch，拔线不再响应）
     m_activeBackend = ActiveBackend::WiredEap;
 
-    if (!m_ipCfg.adapterName.isEmpty()) {
+    // 有线认证的运行时输入必须在【此刻】重算：点击"连接"时可能还没插网线（网卡无
+    // IPv4 → localIp=0），而认证在插线后才发生（见函数注释）
+    refreshWiredRuntimeFields();
+
+    if (m_debugLog) {
+        const QString ipText = QStringLiteral("%1.%2.%3.%4")
+                                   .arg(m_config.localIp[0]).arg(m_config.localIp[1])
+                                   .arg(m_config.localIp[2]).arg(m_config.localIp[3]);
+        const QString macText = QByteArray(reinterpret_cast<const char*>(m_config.localMac), 6)
+                                    .toHex(' ').toUpper();
+        debugLog(QStringLiteral("有线认证输入: 网卡=%1, 静态IP=%2, localIp=%3, localMac=%4")
+                     .arg(m_config.interfaceName,
+                          m_ipCfg.ip.isEmpty() ? QStringLiteral("(未启用)") : m_ipCfg.ip,
+                          ipText, macText));
+    }
+
+    // 静态 IP 判据 = 用户勾选（ConnectionBuilder 保证勾选时 ip 非空且参数合法）。
+    // adapterName 允许为空：等待网线插入的场景下点击连接时还未插线/未选中网卡，
+    // 到真正认证的时刻才解析（解析不到则告警并跳过静态 IP，而不是让认证带着
+    // "未配置的静态 IP"必然失败）
+    if (!m_ipCfg.ip.isEmpty()) {
+        if (m_ipCfg.adapterName.isEmpty())
+            m_ipCfg.adapterName = resolveWiredAdapterName();
+        if (m_ipCfg.adapterName.isEmpty()) {
+            emit logMessage(QStringLiteral("未找到可用的有线网卡，本次跳过静态IP配置"
+                                           "（若认证失败请在「设置」中刷新网卡并查询MAC）"), 1);
+            startAuth();
+            return;
+        }
+
         setState(AppConnectionState::SettingNetwork);
         m_wasStaticIpSet = true;
+        m_staticIpAdapter = m_ipCfg.adapterName;   // 记住真正被写入静态 IP 的网卡
+        m_staticIpPending = true;                  // 请求在途：此间的 DHCP 回执不得清跟踪
 
         emit logMessage(QStringLiteral("正在设置静态IP: %1 / %2 / %3 ...")
                         .arg(m_ipCfg.ip, m_ipCfg.mask, m_ipCfg.gateway), 0);
@@ -217,6 +257,7 @@ void SessionManager::startWiredBackend()
         QTimer::singleShot(IP_SETUP_TIMEOUT, this, [this, gen]() {
             if (gen == m_ipSetupGeneration && m_state == AppConnectionState::SettingNetwork) {
                 emit logMessage(QStringLiteral("静态IP设置超时，请检查适配器名和网络配置"), 2);
+                m_staticIpPending = false;
                 // netsh 可能已部分应用（如 IP 已设、DNS 失败），回滚到 DHCP 避免残留
                 restoreDhcp();
                 setState(AppConnectionState::Disconnected);
@@ -234,6 +275,62 @@ void SessionManager::startWiredBackend()
     } else {
         startAuth();
     }
+}
+
+// 有线认证运行时字段的现场重算（认证时刻调用，见头文件注释）：
+//   · 未启用静态 IP → localIp 取当前有线口真实的 IPv4（UI 里残留的历史地址可能与
+//     实际分配地址不一致，会让 EAP 响应带上错误 IP 被服务端 "Mac, IP, NASip, PORT" 拒绝）；
+//   · 启用静态 IP → localIp 就是用户配置的静态 IP，绝不覆盖；仅在为 0 时回填；
+//   · localMac 全零 → 用当前有线口 MAC 回填（非零视为用户有意指定，如换了网卡但要
+//     沿用已注册的 MAC，不覆盖）；
+//   · 接口无效（Npcap 名变更/网卡未就绪）→ 仅调试记录，不改变任何字段。
+void SessionManager::refreshWiredRuntimeFields()
+{
+    const QNetworkInterface iface = Network::findInterface(m_config.interfaceName);
+    if (!iface.isValid()) {
+        if (m_debugLog)
+            debugLog(QStringLiteral("有线认证输入：未能把 pcap 网卡名 %1 映射到系统网卡，"
+                                    "沿用配置中的 IP/MAC")
+                         .arg(m_config.interfaceName));
+        return;
+    }
+
+    const bool staticIpIntent = !m_ipCfg.ip.isEmpty();
+    // 启用静态 IP 且已有非零地址 → 保留（那是用户配置的静态 IP）；否则取网卡真实 IPv4
+    const bool needLiveIp = !staticIpIntent || ByteUtils::isIpZero(m_config.localIp);
+    if (needLiveIp) {
+        for (const auto& entry : iface.addressEntries()) {
+            if (entry.ip().protocol() == QAbstractSocket::IPv4Protocol
+                && entry.ip().toIPv4Address() != 0) {
+                ByteUtils::ipv4ToBytes(entry.ip(), m_config.localIp);
+                break;
+            }
+        }
+    }
+
+    if (ByteUtils::isMacZero(m_config.localMac)) {
+        const QByteArray hw = QByteArray::fromHex(
+            ByteUtils::normalizeMac(iface.hardwareAddress()).toLatin1());
+        if (hw.size() == 6)
+            memcpy(m_config.localMac, hw.constData(), 6);
+    }
+}
+
+// 静态 IP 的 netsh 目标网卡在认证时刻解析：配置里预解析的名字 → MAC 反查 → pcap 网卡名。
+// 返回空表示无法定位（调用方跳过静态 IP 并告警，绝不以空网卡名调用 netsh）。
+QString SessionManager::resolveWiredAdapterName()
+{
+    if (!m_ipCfg.adapterName.isEmpty())
+        return m_ipCfg.adapterName;
+    if (!m_ipCfg.mac.isEmpty()) {
+        const QString byMac = Network::adapterNameByMac(m_ipCfg.mac);
+        if (!byMac.isEmpty())
+            return byMac;
+    }
+    const QNetworkInterface iface = Network::findInterface(m_config.interfaceName);
+    if (iface.isValid() && !iface.name().isEmpty())
+        return iface.name();
+    return QString();
 }
 
 void SessionManager::startAuth(bool restartEap)
@@ -486,16 +583,19 @@ void SessionManager::stopConnection(bool logoutWifi, bool userInitiated)
     if (m_postLogoutTimeout)
         m_postLogoutTimeout->stop();
 
-    if (m_state == AppConnectionState::Disconnected)
-        return;
-
-    QMetaObject::invokeMethod(m_eapProcess, "stop", Qt::QueuedConnection);
-    stopUdpIfRunning();
-    // 无线注销与否由调用方决定：用户点"断开"或退出且勾选了退出登出 → 注销；
-    // 否则（退出未勾选）仅结束无线会话、不注销（保持 Wi-Fi 连接与在线状态）。
-    if (m_activeBackend == ActiveBackend::PortalWifi && logoutWifi)
-        QMetaObject::invokeMethod(m_webAuthProcess, "stop", Qt::QueuedConnection);
-    m_activeBackend = ActiveBackend::None;
+    // 收尾顺序（重要）：有会话时才停工作进程；DHCP 恢复必须【在】提前返回之前执行——
+    // 等待态（WaitingForNetwork）取消、以及"认证失败后已回 Disconnected 但静态 IP 仍
+    // 在网卡上"的情形都靠这里兜底，提前 return 会让恢复被跳过（用户报告的问题 1）
+    if (m_state != AppConnectionState::Disconnected) {
+        QMetaObject::invokeMethod(m_eapProcess, "stop", Qt::QueuedConnection);
+        stopUdpIfRunning();
+        // 无线注销与否由调用方决定：用户点"断开"或退出且勾选了退出登出 → 注销；
+        // 否则（退出未勾选）仅结束无线会话、不注销（保持 Wi-Fi 连接与在线状态）。
+        if (m_activeBackend == ActiveBackend::PortalWifi && logoutWifi)
+            QMetaObject::invokeMethod(m_webAuthProcess, "stop", Qt::QueuedConnection);
+        m_activeBackend = ActiveBackend::None;
+        m_staticIpPending = false;
+    }
 
     restoreDhcp();
     setState(AppConnectionState::Disconnected);
@@ -554,7 +654,11 @@ void SessionManager::logAdapterDump(const QString& dump)
 
 void SessionManager::restoreDhcp()
 {
-    if (m_ipCfg.adapterName.isEmpty())
+    // 目标网卡以"真正被写入静态 IP 的那块"为准；m_ipCfg 会被下一次 startConnection
+    // 覆盖，若只认它，旧网卡上的静态 IP 将永远不再被恢复（用户报告的问题 1）
+    const QString adapter = !m_staticIpAdapter.isEmpty() ? m_staticIpAdapter
+                                                         : m_ipCfg.adapterName;
+    if (adapter.isEmpty())
         return;
     if (!m_wasStaticIpSet && !m_dhcpRestorePending)
         return;                        // 既没设过静态 IP，也没有未落地的恢复请求
@@ -565,14 +669,19 @@ void SessionManager::restoreDhcp()
     // 最常见的退出路径。
     m_dhcpRestorePending = true;
     QMetaObject::invokeMethod(m_networkWorker, "doSetDhcp", Qt::QueuedConnection,
-                              Q_ARG(QString, m_ipCfg.adapterName));
+                              Q_ARG(QString, adapter));
 }
 
 void SessionManager::onDhcpDone(bool ok, const QString& error)
 {
     m_dhcpRestorePending = false;
     if (ok) {
+        // 请求在途期间可能已进入新一轮静态 IP 设置（doSetStaticIp 排在本次 doSetDhcp
+        // 之后执行）：此时绝不能清跟踪，否则新设的静态 IP 到退出时不会被恢复
+        if (m_staticIpPending)
+            return;
         m_wasStaticIpSet = false;
+        m_staticIpAdapter.clear();
         return;
     }
     // 恢复失败：保留 m_wasStaticIpSet，析构的阻塞收尾会再试一次；同时明确告知用户
@@ -668,6 +777,7 @@ void SessionManager::onStaticIpDone(int gen)
     // 代次防护：新一轮连接会递增代数——旧一轮的完成回调必须丢弃
     if (gen != m_ipSetupGeneration || m_state != AppConnectionState::SettingNetwork)
         return;
+    m_staticIpPending = false;
     emit logMessage(QStringLiteral("静态IP设置完成，开始认证..."), 0);
     startAuth();
 }
@@ -676,6 +786,7 @@ void SessionManager::onStaticIpFailed(const QString& error, int gen)
 {
     if (gen != m_ipSetupGeneration)
         return;   // 旧一轮的失败：新一轮按自己的回调处理
+    m_staticIpPending = false;
     emit logMessage(QStringLiteral("静态IP设置失败: ") + error, 2);
     // 回滚：静态 IP 可能已部分应用（如 IP 已设、DNS 失败），恢复 DHCP 避免残留
     restoreDhcp();
@@ -725,8 +836,8 @@ void SessionManager::onWifiStateChanged(WifiAuthState state, const QString& mess
         break;
 
     case WifiAuthState::Failed:
-        // 与有线同一套调度（夜间直接等到 6:00，白天 5 分钟间隔）
-        handleAuthFailed(retryable, QStringLiteral("无线认证失败，将在明早 6:00 自动重试"));
+        // 与有线同一套调度（夜间直接等到 6:01，白天 5 分钟间隔）
+        handleAuthFailed(retryable, QStringLiteral("无线认证失败，将在明早 6:01 自动重试"));
         // 注意：这里【不】调用 WebAuthProcess::stop()——stop() 会执行 eportal
         // mac/unbind 解绑下线（那是"用户点断开/退出注销"才应有的动作）。
         // 认证失败后 Wi-Fi 仍应保持关联，等调度器重新 start()（start 自身会
@@ -762,14 +873,14 @@ void SessionManager::onWifiOnline()
 void SessionManager::onSystemResume()
 {
     // 睡眠/待机期间进程被挂起：Qt 定时器基于单调时钟（QPC），Windows 在部分
-    // 电源状态下单调时钟在睡眠期间不走或走得不准，因此"距 6:00 的重连等待"
+    // 电源状态下单调时钟在睡眠期间不走或走得不准，因此"距 6:01 的重连等待"
     // 不会因睡眠而过期——早上唤醒后定时器仍要等完剩余时长（最坏拖到下午），
     // 表现为"待机一晚，早晨屏幕亮了却还是断开"。
     //
     // 唤醒后必须用墙钟重新评估重连排程：
     //  - 没有待执行的重连排程（在线 / 手动停用 / 永久错误停止）→ 不干预；
-    //  - 已过 6:00（白天）→ 立即重试；
-    //  - 仍在夜间 → 重排到最近的 6:00。
+    //  - 已过 6:01（白天）→ 立即重试；
+    //  - 仍在夜间 → 重排到最近的 6:01。
     if (m_reconnectTimer && m_reconnectTimer->isActive()) {
         emit logMessage(QStringLiteral("已从待机唤醒，检查自动重连状态..."), 0);
         onReconnectTimeout();   // 内部有状态守卫 + 夜间重排 + 白天立即重连
@@ -795,10 +906,17 @@ void SessionManager::startAutoWait()
     }
     m_autoWaitRunning = true;   // 通知与轮询共用同一"运行中"开关（见头文件注释）
     m_autoWaitTimer->start();
+    // 进入等待态：UI 由此亮「取消」（原「断开」按钮），用户可随时结束等待。
+    // 只有 autoWaitEnabled 且 auto 模式（= 真的开起了监听）才置位，保证
+    // "WaitingForNetwork ⇔ 正在等待（监听或重连排程）"的不变式。
+    setState(AppConnectionState::WaitingForNetwork);
 }
 
 void SessionManager::stopAutoWait()
 {
+    // 注意：本函数【不】改主状态。退出等待态由调用方负责（上线路径会立刻置
+    // SettingNetwork/Authenticating/Connected；取消路径由 stopConnection 统一回
+    // Disconnected），否则 stopAutoWait 会在 onEapSuccess 前制造一次 Disconnected 闪烁。
     m_autoWaitRunning = false;   // 通知路径也必须停（见 onAutoWaitTick 首行）
     if (m_autoWaitTimer)
         m_autoWaitTimer->stop();
@@ -806,28 +924,47 @@ void SessionManager::stopAutoWait()
 
 void SessionManager::onAutoWaitTick()
 {
-    // 运行中开关：stopAutoWait()（已上线 / 失败退避 / 用户断开）之后接口变更通知
-    // 仍会到达，若不拦下会让"失败后立刻再认证"绕过 5 分钟 / 夜间 6:00 的重试节流
+    // 运行中开关：stopAutoWait()（已上线 / 失败退避 / 用户取消）之后接口变更通知
+    // 仍会到达，若不拦下会让"失败后立刻再认证"绕过 5 分钟 / 夜间 6:01 的重试节流
     if (!m_autoWaitRunning)
         return;
     if (!m_autoWaitEnabled || m_connectMode != ConnectMode::Auto)
         return;
-    if (m_state != AppConnectionState::Disconnected)
-        return;                    // 已在认证/在线：由对应路径停止监听
+    // 等待态（WaitingForNetwork）是就绪监听唯一合法的前提状态；其余（认证中/在线/
+    // 已取消）都不应再触发认证
+    if (m_state != AppConnectionState::WaitingForNetwork
+        && m_state != AppConnectionState::Disconnected)
+        return;
 
-    // ① 有线优先：物理有线已接入 → 有线认证
+    // ① 有线优先：物理有线已接入 → 等链路稳定后再认证
     if (Network::ethernetLinkUp()) {
         if (m_reconnectTimer)
             m_reconnectTimer->stop();
-        stopAutoWait();
-        m_activeBackend = ActiveBackend::WiredEap;   // 同步后端：isWifiUiLive/链路监视等依赖它
-        emit logMessage(QStringLiteral("检测到有线网卡已接入，自动开始有线认证..."), 0);
-        // 调试直击"为什么自动选了有线"：此刻把网卡枚举打出来
+        stopAutoWait();          // 状态保持 WaitingForNetwork（本函数不改状态）
         if (m_debugLog) {
             logAdapterDump(Network::dumpAdapters());
-            debugLog(QStringLiteral("自动就绪监听：有线链路 Up → 选有线"));
+            debugLog(QStringLiteral("自动就绪监听：有线链路 Up → 选有线（%1 秒链路稳定等待）")
+                         .arg(AUTO_WIRED_SETTLE_DELAY_MS / 1000));
         }
-        startWiredBackend();
+        // 链路稳定等待：就绪监听的触发时刻就是"插入瞬间"（接口变更通知），此时端口/
+        // 交换机侧 802.1X 往往还没就绪，立刻发 EAPOL-Start 会吃 EAP-Failure——该失败
+        // 按"致命"处理，会直接进 5 分钟/夜间重试，表现为"第一次自动有线认证固定失败、
+        // 手动再连一次就好"。与"无线→有线联动切换"路径用同一套延时。
+        emit logMessage(QStringLiteral("检测到有线网卡已接入，%1 秒后自动开始有线认证...")
+                            .arg(AUTO_WIRED_SETTLE_DELAY_MS / 1000), 0);
+        QTimer::singleShot(AUTO_WIRED_SETTLE_DELAY_MS, this, [this]() {
+            // 等待期间用户点了「取消」（m_autoWaitEnabled=false）或链路又掉了 → 放弃本次
+            if (!m_autoWaitEnabled || m_connectMode != ConnectMode::Auto
+                || m_state != AppConnectionState::WaitingForNetwork)
+                return;   // 用户已取消 / 已被其它路径接管：静默作废本次延时启动
+            if (!Network::ethernetLinkUp()) {
+                emit logMessage(QStringLiteral("有线链路复查未通过，继续等待网络就绪..."), 1);
+                startAutoWait();   // 回到就绪监听，等下一次插入
+                return;
+            }
+            m_activeBackend = ActiveBackend::WiredEap;   // 同步后端：isWifiUiLive/链路监视等依赖它
+            startWiredBackend();
+        });
         return;
     }
     // ② 否则：匹配白名单的 Wi-Fi 已连上 → 无线认证（解决"开机自启早于 Wi-Fi 连接"）
@@ -853,7 +990,7 @@ void SessionManager::scheduleReconnect()
         m_reconnectTimer->setSingleShot(true);
         connect(m_reconnectTimer, &QTimer::timeout, this, &SessionManager::onReconnectTimeout);
     }
-    // 夜间直接等到 6:00 再触发，白天按固定间隔，避免通宵刷屏
+    // 夜间直接等到 6:01 再触发，白天按固定间隔，避免通宵刷屏
     m_reconnectTimer->start(msecsToNextRetry());
 }
 
@@ -862,23 +999,29 @@ void SessionManager::scheduleNextRetry(const QString& nightMessage)
     ++m_retryAttempt;
     // 固定间隔 + 重试序号：不做指数退避是刻意的——本程序的重试是"用户插上网线/连上
     // Wi-Fi 后多久能上网"的唯一路径（失败后不进入就绪监听，见 handleAuthFailed 注释），
-    // 退避到 15~30 分钟会让恢复明显变慢；而整夜刷屏已由"夜间等到 6:00"覆盖。
+    // 退避到 15~30 分钟会让恢复明显变慢；而整夜刷屏已由"夜间等到 6:01"覆盖。
     // 序号只是让长时间连续失败在日志里可分辨。
     emit logMessage(isNightWindow()
                         ? nightMessage
                         : QStringLiteral("认证失败，将在 %1 分钟后自动重试（第 %2 次）")
                               .arg(kReconnectIntervalMs / 60000).arg(m_retryAttempt),
                     1);
-    setState(AppConnectionState::Disconnected);
+    // 重试等待同样是可以取消的等待：UI 亮「取消」，点它即停掉重连定时器（用户要求）
+    setState(AppConnectionState::WaitingForNetwork);
     scheduleReconnect();
 }
 
 void SessionManager::handleAuthFailed(bool retryable, const QString& nightMessage)
 {
+    // 本轮有线会话结束：把静态 IP 还给 DHCP（用户明确要求：有线连不上时要恢复 DHCP，
+    // 否则机器会带着校园静态 IP 离开校园网，且退出前一直无法上网）。
+    // 重试路径（onReconnectTimeout→startWiredBackend）会按需重新配置静态 IP。
+    restoreDhcp();
+
     if (retryable) {
-        // 与时段相关的失败（夜间 6:00 / 白天 5 分钟间隔同一套调度）。
+        // 与时段相关的失败（夜间 6:01 / 白天 5 分钟间隔同一套调度）。
         // 【不要】在此进入就绪监听：那会让 onAutoWaitTick 2 秒内再次触发认证，
-        // 失败→再监听 无限刷屏，并绕过夜间 6:00 / 5 分钟节流。失败重试只走
+        // 失败→再监听 无限刷屏，并绕过夜间 6:01 / 5 分钟节流。失败重试只走
         // scheduleNextRetry 的定时（到点 onReconnectTimeout 再按需重建监听）。
         scheduleNextRetry(nightMessage);
     } else {
@@ -893,8 +1036,12 @@ void SessionManager::handleAuthFailed(bool retryable, const QString& nightMessag
 void SessionManager::handleWorkerStopped(AppConnectionState guardState)
 {
     // 防御守卫：即使未来某条路径在认证中排队了 stop()，也禁止把认证中状态
-    // 回退为 Disconnected（否则连接/断开按钮错位）
-    if (m_state == guardState || m_state == AppConnectionState::Disconnected)
+    // 回退为 Disconnected（否则连接/断开按钮错位）。等待态同理：等待 UI 由
+    // 重连排程/就绪监听驱动，迟到的 Stopped 不得把它打回"未连接"（按钮会错位成
+    // 可用「连接」而实际仍在等待）。
+    if (m_state == guardState
+        || m_state == AppConnectionState::Disconnected
+        || m_state == AppConnectionState::WaitingForNetwork)
         return;
     // 状态回退曾是【静默】的：出问题时日志里既没有"已断开"也没有回退记录，
     // 只剩"界面停在未连接/又认证了一次"这种表象。调试模式下留一条痕迹。
@@ -948,18 +1095,21 @@ bool SessionManager::isNightWindow() const
 int SessionManager::msecsToNextRetry() const
 {
     // 单次取时：原先 isNightWindow() 与 msecsToNextRetry() 各取一次"现在"，
-    // 恰在午夜/6:00 边界上会得到互相矛盾的结果（见 RetryPolicy::nextRetryDelayMs）
+    // 恰在午夜/6:01 边界上会得到互相矛盾的结果（见 RetryPolicy::nextRetryDelayMs）
     return RetryPolicy::nextRetryDelayMs(QDateTime::currentDateTime(), kReconnectIntervalMs);
 }
 
 void SessionManager::onReconnectTimeout()
 {
-    if (m_state != AppConnectionState::Disconnected)
+    // 重连排程可能在两种状态下到点：Disconnected（含人工断开前的残留）与
+    // WaitingForNetwork（重试等待/就绪等待——UI 显示为可取消的等待）
+    if (m_state != AppConnectionState::Disconnected
+        && m_state != AppConnectionState::WaitingForNetwork)
         return;
     stopAutoWait();   // 正式重试：停掉就绪监听（触发后由相应路径重新按需启动）
 
     // 防御分支：定时器可能按旧间隔触发且尚未跨过夜间窗口（如连接被重置后重入），
-    // 若仍在夜间则重新等待到 6:00
+    // 若仍在夜间则重新等待到 6:01
     if (isNightWindow()) {
         m_reconnectTimer->start(msecsToNextRetry());
         return;
@@ -979,6 +1129,7 @@ void SessionManager::onReconnectTimeout()
                 qWarning().noquote() << "auth backend undecided:" << decision.reason;
                 emit logMessage(QStringLiteral("等待网络就绪：插入网线或连接校园 Wi-Fi 后将自动认证..."), 0);
                 m_activeBackend = ActiveBackend::None;
+                restoreDhcp();   // 放弃有线意图：静态 IP 还给 DHCP（见 handleAuthFailed）
                 scheduleReconnect();
                 startAutoWait();
                 break;
@@ -1001,6 +1152,7 @@ void SessionManager::onReconnectTimeout()
                 fb.ssidMatched     = ConnectionBuilder::ssidMatch(wlan.ssid, m_ssidWhitelist);
                 if (RetryPolicy::shouldFallbackToWifi(fb)) {
                     emit logMessage(QStringLiteral("有线连续认证失败，自动回退无线认证..."), 1);
+                    restoreDhcp();   // 转无线：静态 IP 不再有意义，还给 DHCP
                     m_activeBackend = ActiveBackend::PortalWifi;
                     startWifiAuth();
                     break;
@@ -1016,14 +1168,18 @@ void SessionManager::onReconnectTimeout()
                 // （无运行中定时器），新周期 start() 递增代数即可丢弃旧回调，无需 stop()。
                 // UDP 侧不在此处停：下面 desired==WiredEap 分支本就统一停一次
                 // （原先两处都停，同一路径上重复投递两次 stop）
+                if (desired == ActiveBackend::PortalWifi)
+                    restoreDhcp();   // 切无线：静态 IP 还给 DHCP
                 m_activeBackend = desired;
             }
             if (desired == ActiveBackend::WiredEap) {
-                // 跳过静态IP设置阶段（IP 已在上次连接时配置好），直接开始认证。
-                // EAP 用原子的 restart()（复位设备 + 重启，不发射 Stopped），不再依赖
-                // "队列 stop → 队列 start" 的顺序契约；UDP 会话在失败时已停止，直接 start。
+                // 走完整有线流程（而不是只 startAuth）：失败时已恢复 DHCP，静态 IP 必须
+                // 在这里重新应用；startWiredBackend 同时会在认证时刻重算 localIp/MAC
+                // 并解析 netsh 目标网卡（见其函数注释）。
+                // EAP 侧 start() 自身会 closeDevice + resetSessionState，等价于 restart()
+                // 的复位效果，不再依赖"队列 stop → 队列 start"的顺序契约。
                 stopUdpIfRunning();
-                startAuth(/*restartEap=*/true);
+                startWiredBackend();
             } else {
                 // 重新完整走无线流程（内部会先探测在线状态，已在线则直接回 Online）
                 startWifiAuth();
@@ -1038,6 +1194,7 @@ void SessionManager::onReconnectTimeout()
             if (decision.backend == ConnectionBuilder::AuthBackend::None) {
                 qWarning().noquote() << "auth backend undecided:" << decision.reason;
                 emit logMessage(QStringLiteral("等待网络就绪：插入网线或连接校园 Wi-Fi 后将自动认证..."), 0);
+                restoreDhcp();
                 scheduleReconnect();
                 startAutoWait();
                 break;
@@ -1045,8 +1202,10 @@ void SessionManager::onReconnectTimeout()
             m_activeBackend = (decision.backend == ConnectionBuilder::AuthBackend::WiredEap)
                                   ? ActiveBackend::WiredEap
                                   : ActiveBackend::PortalWifi;
+            // 有线一律走完整流程：等待期间静态 IP 已还给 DHCP（进入等待时 restoreDhcp），
+            // 这里必须重新应用，否则会出现"认证带着未配置的静态 IP 必然失败"
             if (m_activeBackend == ActiveBackend::WiredEap)
-                startAuth(/*restartEap=*/true);
+                startWiredBackend();
             else
                 startWifiAuth();
         }

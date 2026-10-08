@@ -8,7 +8,7 @@
 //
 // 背景：这些判断原先内联在 SessionManager（931 行的编排类）与 UdpProcess 的
 // 状态机里，既无法单测，也容易被多处拷贝后各自漂移。抽成纯函数后：
-//   · 时间相关的边界（夜间 0:00-6:00、跨午夜）可穷举验证；
+//   · 时间相关的边界（夜间 0:00-6:01、跨午夜）可穷举验证；
 //   · 有线连续失败回退无线的判据只有一处定义；
 //   · DrCOM 握手超时的"重发/放弃"阈值只有一处定义。
 // 调用方只负责取现场输入（当前时间/失败计数/链路与 SSID 状态）与执行动作。
@@ -16,16 +16,19 @@
 
 namespace RetryPolicy {
 
-// 夜间窗口（校园网 0:00-6:00 禁止上网）的结束小时
-constexpr int kNightEndHour = 6;
+// 夜间窗口（校园网 0:00-6:01 禁止上网）的结束时刻。
+// 分钟取 1 而非 0：实测 6:00:00 整点重连仍会被服务端按夜间窗口拒绝
+// （"当前时段禁止使用"），等一分钟再试才能一次成功。
+constexpr int kNightEndHour   = 6;
+constexpr int kNightEndMinute = 1;
 
-// 是否处于夜间窗口（该时段登录会被服务器拒绝，应等待到 kNightEndHour 再试）
+// 是否处于夜间窗口（该时段登录会被服务器拒绝，应等待到 6:01 再试）
 bool isNightWindow(const QDateTime& now);
 
 // 下一次重试的延迟（ms）：
 //   白天 → baseIntervalMs（固定间隔）
-//   夜间 → 到"当日 kNightEndHour:00"的毫秒数（避免通宵每 5 分钟重试一次刷屏）
-// now 已过 kNightEndHour 时退化为 baseIntervalMs。
+//   夜间 → 到"当日 6:01"的毫秒数（避免通宵每 5 分钟重试一次刷屏）
+// now 已过 6:01 时退化为 baseIntervalMs。
 int nextRetryDelayMs(const QDateTime& now, int baseIntervalMs);
 
 // 有线连续认证失败后是否回退无线（auto 模式）：

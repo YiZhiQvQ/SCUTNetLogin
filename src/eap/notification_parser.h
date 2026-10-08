@@ -17,7 +17,7 @@ namespace NotificationParser {
 
 struct Result {
     QString description;    // 用户可读的中文描述（空 = 未识别）
-    bool    sleepRequired = false;  // 夜间禁网等，需休眠等待到 6:00 再重试
+    bool    sleepRequired = false;  // 夜间禁网等，需休眠等待到 6:01 再重试
     bool    permanent     = false;  // 永久性错误（凭证/账户状态），自动重试无意义
 };
 

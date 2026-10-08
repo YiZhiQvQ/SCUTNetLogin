@@ -215,6 +215,13 @@ constexpr int NETSH_TIMEOUT = 15000;
 // "认证被拒绝"。此处回到与原先等效的余量；仍属现场可调参数。
 constexpr int CONNECT_SWITCH_DELAY_MS = 5000;
 
+// 自动就绪监听（等待网线插入）→ 有线认证前的链路稳定等待。就绪监听由系统接口变更
+// 通知驱动，触发时刻就是"插入瞬间"，此时端口/交换机侧 802.1X 往往尚未就绪；立刻发
+// EAPOL-Start 会收到 EAP-Failure，而该失败按"致命"处理（直接进 5 分钟/夜间 6:01 重试），
+// 表现为"第一次自动有线认证固定失败、手动再连一次就成功"。取值与切换延时一致：
+// 同为"插线后等链路稳定"的场景。
+constexpr int AUTO_WIRED_SETTLE_DELAY_MS = CONNECT_SWITCH_DELAY_MS;
+
 // 链路检测节奏：主路径是系统接口变更通知（NotifyIpInterfaceChange，零轮询），
 // 轮询只在通知注册失败时作为唯一来源（LINK_POLL_INTERVAL_MS，即原行为），
 // 注册成功时退化为"漏事件保险"的低频复核（LINK_RESYNC_INTERVAL_MS）。
