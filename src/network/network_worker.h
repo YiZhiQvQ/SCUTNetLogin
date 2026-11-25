@@ -21,6 +21,8 @@ signals:
     // DHCP 恢复结果回执：退出前"务必恢复 DHCP"的承诺依赖它确认落地，
     // 失败必须上报（机器会留在静态 IP 上，用户需要知道）
     void dhcpDone(bool ok, const QString& error);
+    // 自愈结果：逐条动作说明（成功/失败都回传，由上层落盘）
+    void purgeDone(bool clean, const QString& detail);
 
 public slots:
     void doSetStaticIp(const QString& adapter, const QString& ip, const QString& mask,
@@ -28,6 +30,13 @@ public slots:
                        int generation);
     void doSetDhcp(const QString& adapter);
     void doSetAutoStart(bool enable);
+    // 清理校园静态 IP / 校园 DNS / 环回网关上残留的默认路由（自愈）。
+    // 在启动、进入等待态、恢复 DHCP 失败时投递；keepAdapter 为"可以保留校园配置"的
+    // 接口（当前在用的有线网卡），为空表示不保留任何接口。
+    // campusGateway / campusDns：用于判定"哪块网卡的配置是校园网留下的"，
+    // 只有命中这些值的接口才会被恢复成 DHCP（绝不误改用户其它网络设置）。
+    void doPurgeStaleConfig(const QString& keepAdapter, const QString& campusGateway,
+                            const QStringList& campusDns);
 };
 
 #endif // NETWORK_WORKER_H

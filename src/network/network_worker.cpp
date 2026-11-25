@@ -5,6 +5,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QRegularExpression>
+#include <QStringList>
 #include <QThread>
 #include <windows.h>
 
@@ -33,6 +34,15 @@ void NetworkWorker::doSetStaticIp(const QString& adapter, const QString& ip,
         emit staticIpDone(generation);
     else
         emit staticIpFailed(error, generation);
+}
+
+void NetworkWorker::doPurgeStaleConfig(const QString& keepAdapter, const QString& campusGateway,
+                                     const QStringList& campusDns)
+{
+    QStringList report;
+    const bool clean = Network::purgeStaleCampusIpConfig(campusGateway, campusDns,
+                                                         keepAdapter, &report);
+    emit purgeDone(clean, report.join(QStringLiteral("; ")));
 }
 
 void NetworkWorker::doSetDhcp(const QString& adapter)

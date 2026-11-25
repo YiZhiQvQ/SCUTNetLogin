@@ -159,6 +159,28 @@ MainWindow::MainWindow(QWidget* parent)
         if (m_sessionManager)
             m_sessionManager->setDebugLogEnabled(on);
     });
+    // 认证服务器下拉：两项预置（五山 s.scut.edu.cn / 国际校区 s2.scut.edu.cn），可编辑。
+    // 真实域名存进 itemData —— 下拉列表里的"（国际校区）"只是给人看的备注，
+    // 绝不能进入编辑框，更不能写进配置（否则会当成域名去解析，必然失败）。
+    // uic 不支持 <userData>，故在此处补挂（放在 loadConfig 之前，配置值才能正确回填）。
+    ui->comboHost->setItemData(0, QStringLiteral("s.scut.edu.cn"));
+    ui->comboHost->setItemData(1, QStringLiteral("s2.scut.edu.cn"));
+
+    // 选中预置项后，把编辑框文字换成纯域名：可编辑的 QComboBox 默认会把
+    // "下拉项显示文案"原样塞进编辑框，于是备注会被一起带进去。
+    // 这里同时挂 activated（鼠标点选）与 currentIndexChanged（键盘/程序设置），
+    // 保证任何选法都只落到纯域名上。备注仍可在下拉列表里看到。
+    auto applyPresetHost = [this](int index) {
+        if (index < 0)
+            return;
+        const QString realValue = ui->comboHost->itemData(index).toString();
+        if (!realValue.isEmpty() && ui->comboHost->currentText() != realValue)
+            ui->comboHost->setEditText(realValue);
+    };
+    connect(ui->comboHost, QOverload<int>::of(&QComboBox::activated), this, applyPresetHost);
+    connect(ui->comboHost, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, applyPresetHost);
+
     // DrCOM UDP 心跳保活：关闭方向立即生效（停掉已跑的 UDP 会话），开启方向下次连接生效
     // ——UDP 会话必须跟在一次成功的 802.1X 之后。配置值随后在 loadConfig 恢复。
     connect(ui->checkDrcomHeartbeat, &QCheckBox::toggled, this, [this](bool on) {
@@ -177,7 +199,7 @@ MainWindow::MainWindow(QWidget* parent)
         autoDetectNetworkConfig();
     } else {
         // 未勾选自动连接就不做网卡枚举：下拉保持为空，避免"启动即检测网卡"
-        onLogMessage(QStringLiteral("已关闭「启动后自动连接」：启动不自动检测网卡，"
+        logUiMessage(QStringLiteral("已关闭「启动后自动连接」：启动不自动检测网卡，"
                                     "点击「刷新」或切到「设置」页即可检测"), 0);
     }
     // 惰性检测触发点：首次打开「设置」页（网卡下拉所在页）
@@ -191,7 +213,7 @@ MainWindow::MainWindow(QWidget* parent)
     // 供跨机器对照"这台启动时到底把网卡识别成什么"。
     // 注：网卡枚举在后台进行，此处通常仍为空——填充完成后若要对照请看后续"[调试]"行
     if (ui->checkDebugLog->isChecked()) {
-        onLogMessage(QStringLiteral("[调试] 配置加载: 联网方式=自动, SSID白名单=%1, 选中网卡=%2, "
+        logUiMessage(QStringLiteral("[调试] 配置加载: 联网方式=自动, SSID白名单=%1, 选中网卡=%2, "
                                     "自动检测IP=%3 / MAC=%4")
                          .arg(ui->editSsid->text().trimmed(),
                               ui->comboInterface->currentText().isEmpty()
@@ -247,6 +269,16 @@ MainWindow::~MainWindow()
 {
     m_isQuitting = true;
     QCoreApplication::instance()->removeNativeEventFilter(this);
+    // 顺序关键：必须先销毁 SessionManager，再销毁 ui。
+    // ~SessionManager 第一行是 setState(Disconnected)，状态非 Disconnected 时会
+    // emit stateChanged → 本类 onStateChanged/applyStateUI 会访问 ui-> 下的控件；
+    // 而 SessionManager 是本窗口的子对象（new SessionManager(this)），若先 delete ui
+    // （setupUi 建的控件随之销毁），那条信号就是访问已释放内存——正是崩溃记录里
+    // "SCUTNetLogin.exe 在 Qt6Widgets.dll 内 0xc0000005" 的形态。
+    // 托盘"退出"路径因为先 stopConnection 已把状态置成 Disconnected 才没踩到，
+    // 但任何"析构时仍处于连接/等待状态"的路径都会踩。
+    delete m_sessionManager;
+    m_sessionManager = nullptr;
     delete ui;
 }
 
@@ -326,7 +358,7 @@ void MainWindow::triggerAutoConnect()
         return;
     if (m_sessionManager->state() != AppConnectionState::Disconnected)
         return;
-    onLogMessage(m_silentStartup
+    logUiMessage(m_silentStartup
                      ? QStringLiteral("静默启动：自动连接已开启，正在连接...")
                      : QStringLiteral("自动连接已开启，正在连接..."), 0);
     m_autoConnectPending = true;
@@ -504,7 +536,7 @@ void MainWindow::on_btnQueryMac_clicked()
         ui->editMac->setText(mac);
         return;
     }
-    onLogMessage(QStringLiteral("未能获取网卡 MAC 地址，请手动填写，或先点击「刷新」选择网卡"), 2);
+    logUiMessage(QStringLiteral("未能获取网卡 MAC 地址，请手动填写，或先点击「刷新」选择网卡"), 2);
 }
 
 // ============================================================================
@@ -528,7 +560,7 @@ void MainWindow::loadConfig()
     } else {
         ui->checkSavePassword->setChecked(false);
     }
-    ui->editHost->setText(cfg.host);
+    setHostField(cfg.host);
     ui->editDNSServer->setText(cfg.dns);
 
     ui->editMac->setText(cfg.manualMac);
@@ -572,7 +604,7 @@ AppConfig MainWindow::collectCurrentCfg()
     AppConfig cfg;
     cfg.username      = ui->editUsername->text();
     cfg.password      = ui->editPassword->text();
-    cfg.host          = ui->editHost->text();
+    cfg.host          = currentHost();
     cfg.dns           = ui->editDNSServer->text();
     cfg.backupDns     = ui->editBackupDNS->text();
     cfg.interfaceName = ui->comboInterface->currentData().toString();
@@ -592,11 +624,42 @@ AppConfig MainWindow::collectCurrentCfg()
     return cfg;
 }
 
+// 认证服务器的真实域名：优先取 itemData（预置项），否则取编辑框里的手输值。
+// 显示文案"（国际校区）"只是给人看的说明，绝不能进入配置或网络请求。
+QString MainWindow::currentHost() const
+{
+    // 编辑框里始终是纯域名（选中预置项时由 applyPresetHost 归一化，"（国际校区）"
+    // 这类备注只存在于下拉列表的显示文案里），因此 currentText 就是真相。
+    // 只有在编辑框为空时，才退回选中项的 itemData 兜底。
+    const QString typed = ui->comboHost->currentText().trimmed();
+    if (!typed.isEmpty())
+        return typed;
+    return ui->comboHost->itemData(ui->comboHost->currentIndex()).toString();
+}
+
+// 把配置值回填到下拉：命中预置项就选中它，否则原样写进编辑框。
+// 选中预置项后编辑框里显示的仍是纯域名（备注只在展开的下拉列表里可见）。
+void MainWindow::setHostField(const QString& host)
+{
+    const QString value = host.trimmed().isEmpty() ? QString::fromLatin1(DEFAULT_HOST)
+                                                   : host.trimmed();
+    for (int i = 0; i < ui->comboHost->count(); ++i) {
+        if (ui->comboHost->itemData(i).toString() == value) {
+            ui->comboHost->setCurrentIndex(i);
+            // currentIndexChanged 若未触发（索引未变），这里补一次归一化
+            ui->comboHost->setEditText(value);
+            return;
+        }
+    }
+    ui->comboHost->setCurrentIndex(-1);
+    ui->comboHost->setEditText(value);
+}
+
 void MainWindow::updateHostFieldEnabled(bool heartbeatOn)
 {
     // 地址框置灰后 text() 仍照常可读，getCurrentConfig() 无需改动——关闭只是表明
     // 该值当前不产生任何行为（有线认证走二层 EAPOL，与服务器地址无关）
-    ui->editHost->setEnabled(heartbeatOn);
+    ui->comboHost->setEnabled(heartbeatOn);
     ui->label_host->setEnabled(heartbeatOn);
 }
 
@@ -626,7 +689,7 @@ void MainWindow::on_btnConnect_clicked()
 {
     if (m_sessionManager->state() != AppConnectionState::Disconnected) {
         // 连接中按钮已禁用，但 Ctrl+Enter 快捷键仍可达——给出明确提示
-        onLogMessage(m_sessionManager->state() == AppConnectionState::WaitingForNetwork
+        logUiMessage(m_sessionManager->state() == AppConnectionState::WaitingForNetwork
                          ? QStringLiteral("当前正在等待网络，请先点「取消」结束等待再连接")
                          : QStringLiteral("当前已在连接流程中，请先点「断开」再连接"), 1);
         return;
@@ -642,14 +705,14 @@ void MainWindow::connectWithCurrentInput()
     // 枚举完成后自动续接本次连接（见 enumerateInterfaces 的完成回调）。
     // 期间按"等待"展示（亮「取消」）——取消后不再续接（见 on_btnDisconnect_clicked）
     if (!m_interfacesLoaded) {
-        onLogMessage(QStringLiteral("正在检测网卡，检测完成后将自动继续连接..."), 0);
+        logUiMessage(QStringLiteral("正在检测网卡，检测完成后将自动继续连接..."), 0);
         m_connectAfterEnumeration = true;
         applyStateUI(AppConnectionState::WaitingForNetwork);
         loadInterfaces();
         return;
     }
     if (ui->comboInterface->count() == 0) {
-        onLogMessage(QStringLiteral("未检测到可用网卡，请点击刷新重试"), 2);
+        logUiMessage(QStringLiteral("未检测到可用网卡，请点击刷新重试"), 2);
         applyStateUI(m_sessionManager->state());   // 结束"等待网卡"展示（若正处于其中）
         return;
     }
@@ -689,12 +752,12 @@ void MainWindow::connectWithCurrentInput()
     // 校验失败直接终止（不持久化、不启动）
     ConnectionBuilder::Result r = ConnectionBuilder::build(in);
     if (!r.ok) {
-        onLogMessage(r.error, 2);
+        logUiMessage(r.error, 2);
         applyStateUI(m_sessionManager->state());   // 结束"等待网卡"展示（若正处于其中）
         return;
     }
     if (!r.warning.isEmpty())
-        onLogMessage(r.warning, 1);
+        logUiMessage(r.warning, 1);
 
     saveConfig();
     ui->textLog->clear();
@@ -733,13 +796,13 @@ void MainWindow::autoConnectWithRetry(int attempt)
 
     if (networkNotReady) {
         if (attempt >= AUTO_CONNECT_RETRY_COUNT) {
-            onLogMessage(QStringLiteral("自动连接失败：网卡在约 %1 秒内未就绪，已放弃。请点击\"连接\"或\"刷新网卡\"手动重试。")
+            logUiMessage(QStringLiteral("自动连接失败：网卡在约 %1 秒内未就绪，已放弃。请点击\"连接\"或\"刷新网卡\"手动重试。")
                              .arg(AUTO_CONNECT_RETRY_COUNT * AUTO_CONNECT_RETRY_INTERVAL / 1000), 1);
             m_autoConnectPending = false;
             applyStateUI(m_sessionManager->state());   // 结束等待态展示（恢复连接按钮）
             return;
         }
-        onLogMessage(QStringLiteral("网络尚未就绪，%1 秒后自动重试 (%2/%3) ...")
+        logUiMessage(QStringLiteral("网络尚未就绪，%1 秒后自动重试 (%2/%3) ...")
                          .arg(AUTO_CONNECT_RETRY_INTERVAL / 1000)
                          .arg(attempt + 1).arg(AUTO_CONNECT_RETRY_COUNT), 0);
         // 等待期展示"等待中"并亮「取消」按钮（用户要求所有等待阶段都可取消）：
@@ -766,7 +829,7 @@ void MainWindow::cancelPendingAutoConnect()
     if (!m_autoConnectPending)
         return;
     m_autoConnectPending = false;
-    onLogMessage(QStringLiteral("已取消自动连接等待"), 0);
+    logUiMessage(QStringLiteral("已取消自动连接等待"), 0);
     applyStateUI(m_sessionManager->state());   // 复位为"未连接"（连接按钮恢复可用）
 }
 
@@ -779,7 +842,7 @@ void MainWindow::on_btnDisconnect_clicked()
     // 手动点"连接"后正在等待网卡枚举：取消这次续接（枚举完成回调见 enumerateInterfaces）
     if (m_connectAfterEnumeration) {
         m_connectAfterEnumeration = false;
-        onLogMessage(QStringLiteral("已取消连接等待"), 0);
+        logUiMessage(QStringLiteral("已取消连接等待"), 0);
         applyStateUI(m_sessionManager->state());
     }
 
@@ -812,7 +875,7 @@ void MainWindow::applyStateUI(AppConnectionState state)
     // 等待网络/等待重试：可取消的等待（用户要求所有等待阶段都亮「取消」按钮）
     static const StateInfo kWaitingForNetwork = {
         QStringLiteral("等待网络..."),
-        QStringLiteral("正在等待网线插入或校园 Wi-Fi 连接，将自动认证（点「取消」结束等待）"),
+        QStringLiteral("正在等待网线插入或校园 Wi-Fi 连接，将自动认证"),
         QStringLiteral(" (等待网络...)"), QStringLiteral("connecting"), true,
         QStringLiteral("取消") };
     static const StateInfo kSettingNetwork = {
@@ -928,6 +991,18 @@ void MainWindow::onLogMessage(const QString& message, int level)
 {
     ui->textLog->appendHtml(LogManager::formatHtml(message, level));
     ui->textLog->moveCursor(QTextCursor::End);
+}
+
+// UI 侧消息统一出口：通过 SessionManager::logFromUi 发 logMessage 信号，界面（上面的
+// onLogMessage）与 LogManager 的当日日志文件各得一份。此前 UI 直接调 onLogMessage，
+// 消息只出现在界面上、不落盘——"自动连接已开启/正在检测网卡/已取消等待"这类只有 UI
+// 会说的话在日志里查不到，正好是排查"软件是不是被重启过/有没有自动连"最需要的信息。
+void MainWindow::logUiMessage(const QString& message, int level)
+{
+    if (m_sessionManager)
+        m_sessionManager->logFromUi(message, level);
+    else
+        onLogMessage(message, level);   // 兜底：SessionManager 尚未创建时只写界面
 }
 
 // ============================================================================

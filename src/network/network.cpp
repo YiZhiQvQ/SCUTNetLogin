@@ -19,6 +19,7 @@
 #include <QMetaObject>
 #include <QtEndian>
 #include <vector>
+#include <algorithm>
 #include <QDebug>
 #include <pcap.h>
 
@@ -30,10 +31,26 @@ namespace Network {
 
 struct RawWin32Adapter {
     QString guid;           // AdapterName, e.g. "{XXXXXXXX-...}"
-    QString description;    // Description (friendly name)
+    QString description;    // Description (驱动描述，如 "Realtek PCIe GbE Family Controller")
+    // FriendlyName：用户在"网络连接"里看到的名称（如"以太网""WLAN 2"），**这才是
+    // netsh 接受的 name=**。description 在 netsh 里通常认不出，不要混用。
+    QString friendlyName;
+    DWORD   ifIndex = 0;    // IPv4 接口索引（netsh 也接受十进制索引）
+    // ConvertInterfaceLuidToAlias 的结果，等于"友好名"（如"以太网"、"WLAN 2"）
+    QString luidAlias;
+    // ConvertInterfaceLuidToName 的结果，形如 "ethernet_32774" / "wlan_32769"。
+    // **Qt 6 的 QNetworkInterface::name() 在 Windows 上返回的正是这个**（不是 GUID，
+    // 也不是友好名——初学者最容易在这两个 API 之间搞混）。
+    // 它同样是 netsh 合法的目标名（实测 name=ethernet_32774 可正常读写配置）。
+    QString luidName;
     BYTE    mac[8]{};       // PhysicalAddress (max 8, typically 6)
     ULONG   macLen = 0;
     DWORD   ifType = 0;
+    // 当前生效的 IPv4 地址 / 网关 / DNS —— 自愈清理靠它判断"这块网卡上是不是挂着
+    // 我们（或旧版本）留下的校园配置"，绝不碰与校园配置无关的用户自定义设置。
+    QStringList ipv4;
+    QStringList gateways;
+    QStringList dns;
     // IP_ADAPTER_ADDRESSES::OperStatus 为 IF_OPER_STATUS（iphlpapi <ifdef.h> 枚举，
     // 与 NET_IF_OPER_STATUS 是不同 typedef，不可混用）
     IF_OPER_STATUS operStatus = IfOperStatusUnknown;   // 链路状态（有线插入检测）
@@ -99,13 +116,51 @@ static std::vector<RawWin32Adapter> enumerateWin32Adapters()
     }
     for (PIP_ADAPTER_ADDRESSES a = adapters; a; a = a->Next) {
         RawWin32Adapter ra;
-        ra.guid        = QString::fromLatin1(a->AdapterName);
-        ra.description = QString::fromWCharArray(a->Description);
-        ra.ifType      = a->IfType;
+        ra.guid         = QString::fromLatin1(a->AdapterName);
+        ra.description  = QString::fromWCharArray(a->Description);
+        ra.friendlyName = a->FriendlyName ? QString::fromWCharArray(a->FriendlyName) : QString();
+        ra.ifIndex      = a->IfIndex;
+        ra.ifType       = a->IfType;
+        {
+            wchar_t aliasBuf[NDIS_IF_MAX_STRING_SIZE + 1] = {};
+            if (ConvertInterfaceLuidToAlias(&a->Luid, aliasBuf,
+                                            NDIS_IF_MAX_STRING_SIZE + 1) == NO_ERROR)
+                ra.luidAlias = QString::fromWCharArray(aliasBuf);
+
+            wchar_t nameBuf[NDIS_IF_MAX_STRING_SIZE + 1] = {};
+            if (ConvertInterfaceLuidToNameW(&a->Luid, nameBuf,
+                                            NDIS_IF_MAX_STRING_SIZE + 1) == NO_ERROR)
+                ra.luidName = QString::fromWCharArray(nameBuf);
+        }
         ra.operStatus  = a->OperStatus;
         ra.macLen      = a->PhysicalAddressLength;
         if (ra.macLen > 0 && ra.macLen <= sizeof(ra.mac))
             memcpy(ra.mac, a->PhysicalAddress, ra.macLen);
+
+        for (PIP_ADAPTER_UNICAST_ADDRESS u = a->FirstUnicastAddress; u; u = u->Next) {
+            if (u->Address.lpSockaddr && u->Address.lpSockaddr->sa_family == AF_INET) {
+                const auto* sin = reinterpret_cast<const sockaddr_in*>(u->Address.lpSockaddr);
+                char ipBuf[INET_ADDRSTRLEN] = {};
+                inet_ntop(AF_INET, &sin->sin_addr, ipBuf, sizeof(ipBuf));
+                ra.ipv4 << QString::fromLatin1(ipBuf);
+            }
+        }
+        for (PIP_ADAPTER_GATEWAY_ADDRESS g = a->FirstGatewayAddress; g; g = g->Next) {
+            if (g->Address.lpSockaddr && g->Address.lpSockaddr->sa_family == AF_INET) {
+                const auto* sin = reinterpret_cast<const sockaddr_in*>(g->Address.lpSockaddr);
+                char gwBuf[INET_ADDRSTRLEN] = {};
+                inet_ntop(AF_INET, &sin->sin_addr, gwBuf, sizeof(gwBuf));
+                ra.gateways << QString::fromLatin1(gwBuf);
+            }
+        }
+        for (PIP_ADAPTER_DNS_SERVER_ADDRESS d = a->FirstDnsServerAddress; d; d = d->Next) {
+            if (d->Address.lpSockaddr && d->Address.lpSockaddr->sa_family == AF_INET) {
+                const auto* sin = reinterpret_cast<const sockaddr_in*>(d->Address.lpSockaddr);
+                char dnsBuf[INET_ADDRSTRLEN] = {};
+                inet_ntop(AF_INET, &sin->sin_addr, dnsBuf, sizeof(dnsBuf));
+                ra.dns << QString::fromLatin1(dnsBuf);
+            }
+        }
         result.push_back(ra);
     }
     return result;
@@ -177,6 +232,61 @@ AdapterInfo adapterInfo(const QString& pcapName, const QString& pcapDescription)
 // adapterNameByMac — 通过 MAC 地址查找适配器名（用于 netsh）
 // ============================================================================
 
+// 把任何形式的网卡标识归一成"netsh 能接受的目标"。
+//
+// 实测（Windows 11 / netsh ipv4）各形式的可用性：
+//   · name={GUID}                      → **失败** exit 1（"文件名、目录名或卷标语法不正确"）
+//   · name=以太网（友好名）             → 成功
+//   · name=7（ifIndex 十进制）          → 成功
+//   · name=ethernet_32774（LUID 别名）  → 成功
+//
+// 两个历史坑（都实际发生过）：
+//   ① 旧版把 iface.name() 直接交给 netsh。Qt 5 下它是 {GUID} → 全部 netsh 失败，
+//      静态 IP/校园 DNS/默认路由长期残留，离开校园网后无法上网。
+//   ② 只认 GUID/友好名/描述时，Qt 6 的 iface.name() 变成 LUID 别名
+//      （"ethernet_32774"）→ 解析不出 → 被当成"无效目标"拒绝 → 静态 IP 完全设不上。
+//      因此 LUID 别名必须与友好名同等对待。
+static QString toNetshName(const QString& anyForm)
+{
+    if (anyForm.trimmed().isEmpty())
+        return QString();
+
+    // 已经是十进制索引：直接用
+    bool allDigits = true;
+    for (const QChar c : anyForm) {
+        if (!c.isDigit()) { allDigits = false; break; }
+    }
+    if (allDigits)
+        return anyForm;
+
+    const auto adapters = enumerateWin32Adapters();
+
+    // 依次按 GUID / LUID 别名 / 友好名 / 驱动描述匹配；命中后统一返回友好名
+    // （最可读，且在"网络适配器"属性里能看到），取不到再退回 ifIndex。
+    for (const auto& ra : adapters) {
+        const bool hit = ra.guid.compare(anyForm, Qt::CaseInsensitive) == 0
+                         || (!ra.luidName.isEmpty()
+                             && ra.luidName.compare(anyForm, Qt::CaseInsensitive) == 0)
+                         || (!ra.luidAlias.isEmpty()
+                             && ra.luidAlias.compare(anyForm, Qt::CaseInsensitive) == 0)
+                         || (!ra.friendlyName.isEmpty()
+                             && ra.friendlyName.compare(anyForm, Qt::CaseInsensitive) == 0)
+                         || ra.description.compare(anyForm, Qt::CaseInsensitive) == 0
+                         || QString::number(ra.ifIndex) == anyForm;
+        if (!hit)
+            continue;
+        if (!ra.friendlyName.isEmpty())
+            return ra.friendlyName;
+        if (!ra.luidAlias.isEmpty())
+            return ra.luidAlias;
+        return QString::number(ra.ifIndex);
+    }
+
+    // 认不出：原样返回。调用方仍会过 isUselessNetshTarget，并用 netsh 回读结果判定，
+    // 不会因为"这里没认出来"而误伤（历史回归正是把"没认出"当成"无效"造成的）。
+    return anyForm;
+}
+
 static QString findAdapterGuidByMac(const QString& normalizedMac)
 {
     // Try Qt first
@@ -208,7 +318,274 @@ QString adapterNameByMac(const QString& mac)
     if (normalized.isEmpty())
         return QString();
 
-    return findAdapterGuidByMac(normalized);
+    // 必须转成 netsh 认识的目标名（友好名 / ifIndex），不能把 {GUID} 直接交出去
+    return toNetshName(findAdapterGuidByMac(normalized));
+}
+
+QString netshAdapterName(const QString& anyForm)
+{
+    if (anyForm.isEmpty())
+        return QString();
+
+    // pcap 设备名 \Device\NPF_{GUID} 先取出 GUID
+    static const QRegularExpression npfRe(R"(\\Device\\NPF_\{([A-Fa-f0-9\-]+)\})",
+                                          QRegularExpression::CaseInsensitiveOption);
+    const auto m = npfRe.match(anyForm);
+    if (m.hasMatch())
+        return toNetshName(QStringLiteral("{") + m.captured(1) + QStringLiteral("}"));
+
+    return toNetshName(anyForm);
+}
+
+bool isUselessNetshTarget(const QString& anyForm)
+{
+    if (anyForm.trimmed().isEmpty())
+        return true;
+
+    const auto adapters = enumerateWin32Adapters();
+    const QString resolved = netshAdapterName(anyForm);
+
+    for (const auto& ra : adapters) {
+        // 与 toNetshName 使用同一套"命中"判据，否则会出现
+        // "toNetshName 认出来了、这里还认得空 → 误判为无效目标"的互相矛盾
+        // （这正是 LUID 别名回归的成因）。
+        const bool hit = ra.guid.compare(anyForm, Qt::CaseInsensitive) == 0
+                         || (!ra.luidName.isEmpty()
+                             && ra.luidName.compare(anyForm, Qt::CaseInsensitive) == 0)
+                         || (!ra.luidAlias.isEmpty()
+                             && ra.luidAlias.compare(anyForm, Qt::CaseInsensitive) == 0)
+                         || (!ra.friendlyName.isEmpty()
+                             && (ra.friendlyName.compare(resolved, Qt::CaseInsensitive) == 0
+                                 || ra.friendlyName.compare(anyForm, Qt::CaseInsensitive) == 0))
+                         || ra.description.compare(anyForm, Qt::CaseInsensitive) == 0
+                         || QString::number(ra.ifIndex) == anyForm;
+        if (!hit)
+            continue;
+        // 环回接口：写上网关/DNS 会在路由表里生成 0.0.0.0/0 → 校园网关（metric 1），
+        // 且 DNS 也会被系统合并使用，离开校园网后依然解析到错误服务器。
+        if (ra.ifType == IF_TYPE_SOFTWARE_LOOPBACK)
+            return true;
+        const QString lower = ra.description.toLower();
+        // WAN Miniport 家族：Kernel Debug / Network Monitor / IPv6 / IP / PPPOE ...
+        // 这些接口没有真实链路，给它配 IP 毫无意义且会污染路由与 DNS。
+        if (lower.contains(QStringLiteral("wan miniport"))
+            || lower.contains(QStringLiteral("kernel debug"))
+            || lower.contains(QStringLiteral("teredo"))
+            || lower.contains(QStringLiteral("6to4"))
+            || lower.contains(QStringLiteral("isatap")))
+            return true;
+        return false;
+    }
+    // 解析不到具体接口：**不再直接判死**。历史上这里返回 true，导致 LUID 别名
+    // （Qt 6 的 QNetworkInterface::name()）被拒绝、静态 IP 完全设不上。
+    // 现在放行，由 setStaticIp/setDhcp 用 netsh 回读结果做最终裁决——
+    // netsh 对不存在的接口本来就会报错，不会误写。
+    return false;
+}
+
+// netsh 退出码非 0 但实际已达目标的情形（幂等调用必然命中）。
+// 实测中文 Windows 的原文是「DHCP 已在此接口上启用。」——注意不是"已启用"；
+// 只匹配英文 "already" 会漏掉，从而把正常状态误报成失败。
+static bool isBenignNetshMessage(const QString& text)
+{
+    return text.contains(QStringLiteral("already"), Qt::CaseInsensitive)
+           || text.contains(QStringLiteral("DHCP is already"))
+           || text.contains(QStringLiteral("已在此接口"))
+           || text.contains(QStringLiteral("已启用"));
+}
+
+// 执行 netsh 并把"已在目标状态"视为成功
+static bool runNetshTolerant(const QStringList& args, QString* errorMsg)
+{
+    QString detail;
+    if (runNetsh(args, &detail))
+        return true;
+    if (isBenignNetshMessage(detail))
+        return true;
+    if (errorMsg)
+        *errorMsg = detail;
+    return false;
+}
+
+bool purgeStaleCampusIpConfig(const QString& campusGateway, const QStringList& campusDns,
+                              const QString& keepAdapter, QStringList* report)
+{
+    auto note = [report](const QString& s) {
+        if (report)
+            *report << s;
+        qWarning().noquote() << "[自愈]" << s;
+    };
+
+    bool clean = true;
+    const auto adapters = enumerateWin32Adapters();
+    const QString keepName = keepAdapter.isEmpty() ? QString() : netshAdapterName(keepAdapter);
+
+    // 统一用"已在目标状态也算成功"的封装：中文 Windows 返回
+    // 「DHCP 已在此接口上启用。」且退出码为 1，若按失败处理会把正常状态
+    // 误报成"清理失败"，并在 UI 上闪一条红色错误（曾经真的这么报过）。
+    auto setDhcpOn = [&](const QString& name, const QString& tag) {
+        QString err;
+        const QStringList addrArgs = { QStringLiteral("interface"), QStringLiteral("ipv4"),
+                                       QStringLiteral("set"), QStringLiteral("address"),
+                                       QStringLiteral("name=%1").arg(name),
+                                       QStringLiteral("source=dhcp") };
+        if (!runNetshTolerant(addrArgs, &err)) {
+            clean = false;
+            note(QStringLiteral("%1 地址恢复 DHCP 失败(%2): %3").arg(tag, name, err));
+        }
+        QString dnsErr;
+        const QStringList dnsArgs = { QStringLiteral("interface"), QStringLiteral("ipv4"),
+                                      QStringLiteral("set"), QStringLiteral("dnsservers"),
+                                      QStringLiteral("name=%1").arg(name),
+                                      QStringLiteral("source=dhcp") };
+        if (!runNetshTolerant(dnsArgs, &dnsErr)) {
+            note(QStringLiteral("%1 DNS 恢复 DHCP 未成功(%2): %3").arg(tag, name, dnsErr));
+        }
+    };
+
+    // 判定"这块网卡的当前配置里有没有校园网痕迹"：
+    //   · 网关命中 campusGateway；或
+    //   · DNS 命中 campusDns 中的任意一个；或
+    //   · 地址落在校园静态 IP 所属网段（调用方通过 keepAdapter 之外的 IP 无法判断，
+    //     因此退化为"有网关且有 DNS"——校园静态 IP 必然同时带这两项）。
+    // 只清有痕迹的接口，绝不动用户自己的其它网络配置（如热点、公司网络）。
+    auto hasCampusTrace = [&](const RawWin32Adapter& ra) {
+        if (!campusGateway.isEmpty()
+            && std::any_of(ra.gateways.begin(), ra.gateways.end(),
+                           [&](const QString& g) { return g == campusGateway; }))
+            return true;
+        for (const QString& d : ra.dns) {
+            if (campusDns.contains(d))
+                return true;
+        }
+        // 网关 + DNS 同时存在但没有可用判据（campusDns 为空）时不动，避免误伤
+        return false;
+    };
+
+    for (const auto& ra : adapters) {
+        const QString name = ra.friendlyName.isEmpty() ? QString::number(ra.ifIndex)
+                                                       : ra.friendlyName;
+
+        if (ra.ifType == IF_TYPE_SOFTWARE_LOOPBACK) {
+            // 环回上的网关是破坏性最大的一项：它会生成 metric=1 的默认路由，
+            // 优先级高于手机热点，把全部流量送进黑洞。环回接口本就不该有任何网关/
+            // DNS，因此无条件清理（这不是"用户的配置"）。
+            if (!ra.gateways.isEmpty() || !ra.dns.isEmpty()) {
+                setDhcpOn(name, QStringLiteral("环回接口"));
+                note(QStringLiteral("环回接口存在网关%1/DNS%2，已清除")
+                         .arg(ra.gateways.join(QLatin1Char('+')),
+                              ra.dns.join(QLatin1Char('+'))));
+            }
+            // 环回上的持久默认路由必须显式删除，否则重启后依旧生效
+            QString routeErr;
+            const QStringList routeArgs = { QStringLiteral("interface"), QStringLiteral("ipv4"),
+                                            QStringLiteral("delete"), QStringLiteral("route"),
+                                            QStringLiteral("prefix=0.0.0.0/0"),
+                                            QStringLiteral("interface=%1").arg(name),
+                                            QStringLiteral("store=persistent") };
+            if (runNetsh(routeArgs, &routeErr))
+                note(QStringLiteral("已删除环回接口上的持久默认路由"));
+            continue;
+        }
+
+        // 明确保留的接口（通常是当前在用的有线网卡）不动
+        if (!keepName.isEmpty()
+            && (ra.friendlyName.compare(keepName, Qt::CaseInsensitive) == 0
+                || ra.guid.compare(keepAdapter, Qt::CaseInsensitive) == 0)) {
+            continue;
+        }
+
+        // WAN Miniport / Teredo / 内核调试口等：绝不该带任何 IP 配置，
+        // 出现过就说明历史路径写错了目标（本次故障的根源之一），一律清掉。
+        if (isUselessNetshTarget(ra.guid)) {
+            if (!ra.ipv4.isEmpty() || !ra.gateways.isEmpty() || !ra.dns.isEmpty()) {
+                setDhcpOn(name, QStringLiteral("无效接口"));
+                note(QStringLiteral("已清理无效接口残留: %1 [%2]").arg(name, ra.description));
+            }
+            continue;
+        }
+
+        // 其它真实网卡：只有确实挂着校园配置才动手（关键——否则会清掉用户自己的设置）
+        if (hasCampusTrace(ra)) {
+            setDhcpOn(name, QStringLiteral("校园配置残留"));
+            note(QStringLiteral("已清除校园配置残留: %1 网关[%2] DNS[%3]")
+                     .arg(name, ra.gateways.join(QLatin1Char('+')),
+                          ra.dns.join(QLatin1Char('+'))));
+        }
+    }
+
+    return clean;
+}
+QString dumpIpConfigSnapshot()
+{
+    QStringList out;
+
+    // ① IPv4 默认路由（含持久路由）—— 残留的校园网关会在这里原形毕露
+    PMIB_IPFORWARD_TABLE2 fwd = nullptr;
+    if (GetIpForwardTable2(AF_INET, &fwd) == NO_ERROR && fwd) {
+        for (ULONG i = 0; i < fwd->NumEntries; ++i) {
+            const MIB_IPFORWARD_ROW2& row = fwd->Table[i];
+            if (row.DestinationPrefix.PrefixLength != 0)
+                continue;
+            if (row.DestinationPrefix.Prefix.si_family != AF_INET)
+                continue;
+            const auto* nh = reinterpret_cast<const sockaddr_in*>(&row.NextHop);
+            if (!nh || nh->sin_addr.S_un.S_addr == 0)
+                continue;
+            char nhBuf[INET_ADDRSTRLEN] = {};
+            inet_ntop(AF_INET, &nh->sin_addr, nhBuf, sizeof(nhBuf));
+            out << QStringLiteral("[路由] 默认路由 网关=%1 接口LUID=%2 度量=%3")
+                       .arg(QString::fromLatin1(nhBuf))
+                       .arg(static_cast<qulonglong>(row.InterfaceLuid.Value))
+                       .arg(row.Metric);
+        }
+        FreeMibTable(fwd);
+    } else {
+        out << QStringLiteral("[路由] GetIpForwardTable2 失败，无法枚举默认路由");
+    }
+
+    // ② 每块网卡的 IPv4 地址与 DNS —— 静态残留 / 校园 DNS 挂在错误接口上一眼可见
+    ULONG bufLen = 0;
+    if (GetAdaptersAddresses(AF_INET, 0, nullptr, nullptr, &bufLen) == ERROR_BUFFER_OVERFLOW
+        && bufLen > 0) {
+        std::vector<BYTE> buf(bufLen);
+        auto* adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
+        if (GetAdaptersAddresses(AF_INET, 0, nullptr, adapters, &bufLen) == NO_ERROR) {
+            for (auto* a = adapters; a; a = a->Next) {
+                const QString name = a->FriendlyName ? QString::fromWCharArray(a->FriendlyName)
+                                                     : QStringLiteral("(无)");
+                QStringList ips;
+                for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
+                    if (u->Address.lpSockaddr
+                        && u->Address.lpSockaddr->sa_family == AF_INET) {
+                        const auto* sin = reinterpret_cast<const sockaddr_in*>(
+                            u->Address.lpSockaddr);
+                        char ipb[INET_ADDRSTRLEN] = {};
+                        inet_ntop(AF_INET, &sin->sin_addr, ipb, sizeof(ipb));
+                        ips << QString::fromLatin1(ipb);
+                    }
+                }
+                QStringList dns;
+                for (auto* d = a->FirstDnsServerAddress; d; d = d->Next) {
+                    if (d->Address.lpSockaddr
+                        && d->Address.lpSockaddr->sa_family == AF_INET) {
+                        const auto* sin = reinterpret_cast<const sockaddr_in*>(
+                            d->Address.lpSockaddr);
+                        char dnsb[INET_ADDRSTRLEN] = {};
+                        inet_ntop(AF_INET, &sin->sin_addr, dnsb, sizeof(dnsb));
+                        dns << QString::fromLatin1(dnsb);
+                    }
+                }
+                out << QStringLiteral("[网卡] %1 (idx=%2) IP=[%3] DNS=[%4]")
+                           .arg(name)
+                           .arg(a->IfIndex)
+                           .arg(ips.join(QLatin1Char(',')))
+                           .arg(dns.join(QLatin1Char(',')));
+            }
+        }
+    }
+
+    return out.join(QLatin1Char('\n'));
 }
 
 // ============================================================================
@@ -282,6 +659,25 @@ QList<InterfaceEntry> listInterfaces()
 // netsh 命令执行
 // ============================================================================
 
+// 控制台程序输出编码容错：先按 UTF-8 解，出现替换字符再退回系统本地代码页
+// （中文 Windows 为 GBK/936）。netsh / route / schtasks 在不同版本下不一致，
+// 硬编码任何一种都会在某些机器上解成乱码——而乱码会直接破坏"按文本判定状态"的逻辑。
+static QString decodeConsoleText(const QByteArray& raw)
+{
+    if (raw.isEmpty())
+        return QString();
+
+    const QString asUtf8 = QString::fromUtf8(raw);
+    if (!asUtf8.contains(QChar::ReplacementCharacter))
+        return asUtf8;
+
+    const QString asLocal = QString::fromLocal8Bit(raw);
+    // 本地代码页解码结果里若仍有替换字符，取两者中"更干净"的一个
+    if (asLocal.contains(QChar::ReplacementCharacter))
+        return asUtf8;
+    return asLocal;
+}
+
 bool runNetsh(const QStringList& args, QString* errorMsg)
 {
     QProcess proc;
@@ -289,7 +685,11 @@ bool runNetsh(const QStringList& args, QString* errorMsg)
         cpa->flags |= CREATE_NO_WINDOW;
     });
     proc.start(systemExecutable(QStringLiteral("netsh.exe")), args);
-
+    if (!proc.waitForStarted(NETSH_TIMEOUT)) {
+        if (errorMsg)
+            *errorMsg = QStringLiteral("netsh 无法启动: %1").arg(args.join(QLatin1Char(' ')));
+        return false;
+    }
     if (!proc.waitForFinished(NETSH_TIMEOUT)) {
         // 显式终止挂起的 netsh（QProcess 析构也会杀，但显式 kill 保证
         // 错误信息可读且不依赖析构时序）
@@ -303,43 +703,163 @@ bool runNetsh(const QStringList& args, QString* errorMsg)
         return false;
     }
 
+    // netsh 把大部分错误写到 **stdout**（而非 stderr），原先只读 stderr 会让
+    // "文件名、目录名或卷标语法不正确" 这类关键提示变成空字符串。
+    // 编码也必须容错：本机实测 netsh 的本地化文本是 **UTF-8**，而按 GBK 解会把
+    // "已在此接口上启用 DHCP" 解成乱码，进而让上面的幂等判定失配、
+    // 把正常情况误报成"清理失败"。
+    const QString outText = decodeConsoleText(proc.readAllStandardOutput()).trimmed();
+    const QString errText = decodeConsoleText(proc.readAllStandardError()).trimmed();
+
     if (proc.exitCode() != 0) {
         if (errorMsg) {
-            QString err = QString::fromLocal8Bit(proc.readAllStandardError()).trimmed();
-            if (err.isEmpty())
-                err = QString::fromLocal8Bit(proc.readAllStandardOutput()).trimmed();
+            QString detail = errText.isEmpty() ? outText : errText;
             *errorMsg = QString("netsh 失败 (exit=%1): %2\n%3")
                             .arg(proc.exitCode())
-                            .arg(args.join(' '), err);
+                            .arg(args.join(' '), detail);
         }
         return false;
     }
 
+    // 退出码 0 也未必真的生效（历史坑：name= 为空时 netsh 静默成功）。这里只负责把
+    // 输出透传给调用方做二次校验，判定逻辑放在 setStaticIp/setDhcp 里。
+    if (errorMsg && !outText.isEmpty())
+        *errorMsg = outText;
     return true;
 }
 
+// 逐字段核对网卡当前 IPv4 配置：静态 IP 必须地址/掩码/网关都对上；DHCP 必须
+// DHCP 已启用且没有残留的静态网关与静态 DNS。netsh 报成功但实际没生效的情况真实存在，
+// 只信回读结果——"以为恢复了 DHCP，其实还挂着校园静态 IP"是最难自查的故障。
+static bool verifyIpv4Config(const QString& netshName, bool expectStatic,
+                             const QString& ip, const QString& mask,
+                             const QString& gw, const QString& dns1,
+                             QString* detail)
+{
+    const QStringList args = { QStringLiteral("interface"), QStringLiteral("ipv4"),
+                               QStringLiteral("show"), QStringLiteral("config"),
+                               QStringLiteral("name=%1").arg(netshName) };
+    QString out;
+    if (!runNetsh(args, &out)) {
+        if (detail)
+            *detail = QStringLiteral("回读配置失败: %1").arg(out);
+        return false;
+    }
+
+    auto valueOf = [&out](const QString& key, const QString& keyZh) -> QString {
+        for (const QString& line : out.split(QLatin1Char('\n'))) {
+            const QString t = line.trimmed();
+            for (const QString& k : { key, keyZh }) {
+                if (k.isEmpty() || !t.startsWith(k))
+                    continue;
+                const int colon = t.indexOf(QLatin1Char(':'));
+                if (colon >= 0)
+                    return t.mid(colon + 1).trimmed();
+            }
+        }
+        return QString();
+    };
+
+    const QString dhcpText  = valueOf(QStringLiteral("DHCP enabled"), QStringLiteral("DHCP 已启用"));
+    const QString addrText  = valueOf(QStringLiteral("IP Address"), QStringLiteral("IP 地址"));
+    const QString gwText    = valueOf(QStringLiteral("Default Gateway"), QStringLiteral("默认网关"));
+    // 掩码行形如 "Subnet Prefix: 10.40.16.0/23 (mask 255.255.254.0)"，只取括号里的点分掩码
+    const QString prefixText = valueOf(QStringLiteral("Subnet Prefix"), QStringLiteral("子网前缀"));
+    const QString dnsText    = valueOf(QStringLiteral("DNS servers"), QStringLiteral("DNS 服务器"));
+    static const QRegularExpression maskRe(QStringLiteral("\\(mask\\s+([0-9.]+)\\)"));
+    const auto maskMatch = maskRe.match(prefixText);
+    const QString maskText = maskMatch.hasMatch() ? maskMatch.captured(1) : QString();
+
+    if (expectStatic) {
+        bool ok = true;
+        QStringList bad;
+        if (!dhcpText.contains(QStringLiteral("No"), Qt::CaseInsensitive)
+            && !dhcpText.contains(QStringLiteral("否"))) {
+            ok = false;
+            bad << QStringLiteral("DHCP 未关闭");
+        }
+        if (!ip.isEmpty() && !addrText.startsWith(ip)) {
+            ok = false;
+            bad << QStringLiteral("地址实际为[%1] 期望[%2]").arg(addrText, ip);
+        }
+        if (!gw.isEmpty() && !gwText.startsWith(gw)) {
+            ok = false;
+            bad << QStringLiteral("网关实际为[%1] 期望[%2]").arg(gwText, gw);
+        }
+        if (!mask.isEmpty() && !maskText.isEmpty() && maskText != mask) {
+            ok = false;
+            bad << QStringLiteral("掩码实际为[%1] 期望[%2]").arg(maskText, mask);
+        }
+        // DNS 必须真的生效：曾经出现过"地址设上去了、DNS 没设上"的半残状态
+        if (!dns1.isEmpty() && !out.contains(dns1)) {
+            ok = false;
+            bad << QStringLiteral("DNS 未包含[%1](实际[%2])").arg(dns1, dnsText);
+        }
+        if (!ok && detail)
+            *detail = QStringLiteral("静态IP 回读不符: %1").arg(bad.join(QStringLiteral("; ")));
+        return ok;
+    }
+
+    // 期望 DHCP：必须 DHCP=Yes，且不能再挂静态网关/DNS
+    bool ok = true;
+    QStringList bad;
+    const bool dhcpOn = dhcpText.contains(QStringLiteral("Yes"), Qt::CaseInsensitive)
+                        || dhcpText.contains(QStringLiteral("是"));
+    if (!dhcpOn) {
+        ok = false;
+        bad << QStringLiteral("DHCP 未启用(实际[%1])").arg(dhcpText);
+    }
+    if (!gwText.isEmpty() && gwText != QLatin1String("-")) {
+        ok = false;
+        bad << QStringLiteral("仍残留静态网关[%1]").arg(gwText);
+    }
+    if (!ok && detail)
+        *detail = QStringLiteral("DHCP 回读不符: %1").arg(bad.join(QStringLiteral("; ")));
+    return ok;
+}
+
+// 两个入口都必须先把标识转成 netsh 认识的名称：传进来的可能是 {GUID}
+// （adapterNameByMac 的历史返回值）或 pcap 设备名。
 bool setStaticIp(const QString& winName, const QString& ip, const QString& mask,
                  const QString& gw, const QString& dns1, const QString& dns2,
                  QString* errorMsg)
 {
+    const QString target = netshAdapterName(winName);
+    // 目标为空或指向环回/WAN Miniport：绝不能写。写错会把网关/DNS 挂到假接口上，
+    // 在路由表里留下持久默认路由，离开校园网后依然上不了网。
+    if (target.isEmpty() || isUselessNetshTarget(winName)) {
+        if (errorMsg) {
+            *errorMsg = QStringLiteral("拒绝向无效目标[%1]写入静态IP（解析结果[%2]）")
+                            .arg(winName, target);
+        }
+        return false;
+    }
+
     QStringList errors;
     bool ok = true;
     QString err;
-    if (!runNetsh({"interface", "ip", "set", "address", winName, "static", ip, mask, gw}, &err)) {
+    if (!runNetshTolerant({"interface", "ip", "set", "address", target, "static", ip, mask, gw}, &err)) {
         qWarning().noquote() << err;
         errors << err;
         ok = false;
     }
-    if (!runNetsh({"interface", "ip", "set", "dns", winName, "static", dns1}, &err)) {
+    if (!runNetshTolerant({"interface", "ip", "set", "dns", target, "static", dns1}, &err)) {
         qWarning().noquote() << err;
         errors << err;
         ok = false;
     }
     if (!dns2.isEmpty()) {
-        if (!runNetsh({"interface", "ip", "add", "dns", winName, dns2}, &err)) {
+        if (!runNetshTolerant({"interface", "ip", "add", "dns", target, dns2}, &err)) {
             qWarning().noquote() << err;
             errors << err;
             ok = false;   // 备用 DNS 失败同样是"配置未完整生效"，不能对外报成功
+        }
+    }
+    if (ok) {
+        QString detail;
+        if (!verifyIpv4Config(target, /*expectStatic=*/true, ip, mask, gw, dns1, &detail)) {
+            errors << detail;
+            ok = false;
         }
     }
     if (!ok && errorMsg)
@@ -349,18 +869,35 @@ bool setStaticIp(const QString& winName, const QString& ip, const QString& mask,
 
 bool setDhcp(const QString& winName, QString* errorMsg)
 {
+    const QString target = netshAdapterName(winName);
+    if (target.isEmpty() || isUselessNetshTarget(winName)) {
+        if (errorMsg) {
+            *errorMsg = QStringLiteral("拒绝向无效目标[%1]恢复 DHCP（解析结果[%2]）")
+                            .arg(winName, target);
+        }
+        return false;
+    }
+
     QStringList errors;
     bool ok = true;
     QString err;
-    if (!runNetsh({"interface", "ip", "set", "address", winName, "dhcp"}, &err)) {
+    if (!runNetshTolerant({"interface", "ip", "set", "address", target, "dhcp"}, &err)) {
         qWarning().noquote() << err;
         errors << err;
         ok = false;
     }
-    if (!runNetsh({"interface", "ip", "set", "dns", winName, "dhcp"}, &err)) {
+    if (!runNetshTolerant({"interface", "ip", "set", "dns", target, "dhcp"}, &err)) {
         qWarning().noquote() << err;
         errors << err;
         ok = false;
+    }
+    if (ok) {
+        QString detail;
+        if (!verifyIpv4Config(target, /*expectStatic=*/false, QString(), QString(),
+                              QString(), QString(), &detail)) {
+            errors << detail;
+            ok = false;
+        }
     }
     if (!ok && errorMsg)
         *errorMsg = errors.join('\n');

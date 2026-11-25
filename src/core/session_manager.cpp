@@ -2,10 +2,12 @@
 #include "core/byte_utils.h"
 #include "core/constants.h"
 #include "core/retry_policy.h"
+#include "core/watchdog.h"
 #include "config/config_manager.h"
 #include "network/network.h"
 #include "wifi/wlan_media.h"
 #include "log/log_manager.h"
+#include <QCoreApplication>
 #include <QNetworkInterface>
 #include <QTimer>
 #include <QMetaObject>
@@ -24,6 +26,9 @@ SessionManager::SessionManager(QObject* parent)
 
 SessionManager::~SessionManager()
 {
+    // 先停看门狗：析构里的阻塞收尾（尤其是 BlockingQueuedConnection 等 netsh）
+    // 可能超过卡死阈值，不能让它把正常退出误记成 HANG。
+    stopWatchdog();
     setState(AppConnectionState::Disconnected);
 
     // 退出前必须恢复 DHCP：若连接时设置了静态 IP，任何退出路径（含进程被杀、
@@ -121,6 +126,7 @@ void SessionManager::initProcesses()
     connect(m_networkWorker, &NetworkWorker::staticIpFailed, this, &SessionManager::onStaticIpFailed);
     connect(m_networkWorker, &NetworkWorker::autoStartDone,  this, &SessionManager::onAutoStartDone);
     connect(m_networkWorker, &NetworkWorker::dhcpDone,       this, &SessionManager::onDhcpDone);
+    connect(m_networkWorker, &NetworkWorker::purgeDone,      this, &SessionManager::onPurgeDone);
     m_networkThread.start();
 
     // -- 无线 Portal 认证线程（懒启动：首次无线连接才拉起，同 EAP/UDP 约定） --
@@ -137,6 +143,17 @@ void SessionManager::initProcesses()
     // 把 Qt 自身的 qWarning/qCritical 也接进日志文件：GUI 程序没有控制台，
     // 否则网卡枚举失败、netsh 失败详情、autostart 变更等诊断信息全部不可见
     LogManager::installQtMessageHandler(m_logManager);
+
+    // 看门狗：主线程活性 + 卡死现场取证（独立线程，不依赖本线程事件循环）。
+    // 必须在这里启动—— pcap/netsh 层的卡死会让本线程定时器一起停摆，
+    // 只有独立线程能记录现场。
+    HangWatch::setSnapshotProvider(&Network::dumpIpConfigSnapshot);
+    HangWatch::start(QCoreApplication::applicationDirPath() + QStringLiteral("/log"));
+    startWatchdog();
+
+    // 启动即自愈一次：上一次运行（或旧版本）可能把静态 IP / 校园 DNS / 环回网关
+    // 留在机器上。此时用户往往还没连校园网（正在用热点），不清理就"能连不能上"。
+    purgeStaleCampusConfig();
 }
 
 // ============================================================================
@@ -161,6 +178,7 @@ void SessionManager::startConnection(const AuthConfig& config, const StaticIpCon
     m_wiredFailStreak = 0;    // 用户主动发起：有线失败计数清零（auto 回退语义从零开始）
     m_retryAttempt    = 0;    // 重试序号同样从零开始（日志语义）
     m_autoWaitEnabled = true; // 用户手动连接：恢复自动就绪重连
+    m_purgeDoneSinceLastWait = false;   // 新一轮连接：允许重新做一次残留清理
 
     // 调试：每次连接尝试输出一次完整网卡枚举（直击"为什么判定有线"）
     if (m_debugLog)
@@ -243,9 +261,19 @@ void SessionManager::startWiredBackend()
         m_wasStaticIpSet = true;
         m_staticIpAdapter = m_ipCfg.adapterName;   // 记住真正被写入静态 IP 的网卡
         m_staticIpPending = true;                  // 请求在途：此间的 DHCP 回执不得清跟踪
+        HangWatch::setPhase(QStringLiteral("设置静态IP: %1 → %2")
+                                .arg(m_ipCfg.adapterName, m_ipCfg.ip));
+        if (m_debugLog)
+            debugLog(QStringLiteral("设置静态IP 前现场:\n") + Network::dumpIpConfigSnapshot());
 
-        emit logMessage(QStringLiteral("正在设置静态IP: %1 / %2 / %3 ...")
-                        .arg(m_ipCfg.ip, m_ipCfg.mask, m_ipCfg.gateway), 0);
+        // 界面日志只说"在做什么"，具体 IP/掩码/网关属于排查细节，走调试日志：
+        // 平时用户不需要看到 10.40.16.57 / 255.255.254.0 / 10.40.16.254 这类数字，
+        // 而真要排查时打开「启用调试输出」就能拿到完整参数。
+        emit logMessage(QStringLiteral("正在设置静态IP..."), 0);
+        if (m_debugLog)
+            debugLog(QStringLiteral("静态IP 参数: ip=%1 mask=%2 gateway=%3 dns1=%4 dns2=%5")
+                         .arg(m_ipCfg.ip, m_ipCfg.mask, m_ipCfg.gateway,
+                              m_ipCfg.dns1, m_ipCfg.dns2));
 
         // 代次防护：用户可能在设置阶段再次发起连接（断线重连/链路切换/手动点连接）
         // ——旧一组的完成回调/超时不得误触新一组
@@ -668,6 +696,9 @@ void SessionManager::restoreDhcp()
     // 失效——而"stopConnection → restoreDhcp → quit → ~SessionManager"正是
     // 最常见的退出路径。
     m_dhcpRestorePending = true;
+    HangWatch::setPhase(QStringLiteral("恢复 DHCP: %1").arg(adapter));
+    if (m_debugLog)
+        debugLog(QStringLiteral("恢复 DHCP 前现场:\n") + Network::dumpIpConfigSnapshot());
     QMetaObject::invokeMethod(m_networkWorker, "doSetDhcp", Qt::QueuedConnection,
                               Q_ARG(QString, adapter));
 }
@@ -682,11 +713,85 @@ void SessionManager::onDhcpDone(bool ok, const QString& error)
             return;
         m_wasStaticIpSet = false;
         m_staticIpAdapter.clear();
+        HangWatch::setPhase(QStringLiteral("空闲"));
+        if (m_debugLog)
+            debugLog(QStringLiteral("恢复 DHCP 后现场:\n") + Network::dumpIpConfigSnapshot());
         return;
     }
     // 恢复失败：保留 m_wasStaticIpSet，析构的阻塞收尾会再试一次；同时明确告知用户
     // （这是"机器留在静态 IP 上"这类最难自查的故障，不能静默）
     emit logMessage(QStringLiteral("恢复 DHCP 失败（静态 IP 可能仍留在网卡上）: %1").arg(error), 2);
+    // 自愈：常规恢复失败时改用"逐接口清理"再试一次。历史上正是这条路径静默失败，
+    // 导致静态 IP / 校园 DNS / 环回网关整夜残留（连手机热点也无法上网）。
+    purgeStaleCampusConfig();
+}
+
+// ============================================================================
+// 校园配置残留自愈
+// ============================================================================
+
+void SessionManager::purgeStaleCampusConfig(const QString& keepAdapter)
+{
+    // 独立于静态 IP 设置状态：即使本轮没勾选静态 IP，上一次残留（含旧版本写错目标
+    // 留下的环回网关/持久路由）也必须清掉，否则离开校园网后依然上不了网。
+    HangWatch::setPhase(QStringLiteral("清理校园配置残留"));
+
+    // 用本次配置里的校园网关/DNS 作为"哪些配置是我们留下的"判据；配置尚未加载时
+    // 退化为默认校园 DNS，保证启动自愈也能识别旧版本写下的残留。
+    QStringList campusDns;
+    for (const QString& d : { m_ipCfg.dns1, m_ipCfg.dns2, m_config.dnsServer }) {
+        if (!d.isEmpty() && !campusDns.contains(d))
+            campusDns << d;
+    }
+    if (campusDns.isEmpty()) {
+        static const QStringList kDefaultCampusDns = {
+            QStringLiteral("202.38.193.33"), QStringLiteral("202.112.17.33") };
+        campusDns = kDefaultCampusDns;
+    }
+    const QString campusGateway = m_ipCfg.gateway;
+
+    QMetaObject::invokeMethod(m_networkWorker, "doPurgeStaleConfig", Qt::QueuedConnection,
+                              Q_ARG(QString, keepAdapter),
+                              Q_ARG(QString, campusGateway),
+                              Q_ARG(QStringList, campusDns));
+}
+
+void SessionManager::onPurgeDone(bool clean, const QString& detail)
+{
+    HangWatch::setPhase(QStringLiteral("空闲"));
+    if (detail.isEmpty())
+        return;
+    // 有动作才落日志：没有残留时 detail 为空，避免每次连接都刷一行
+    emit logMessage(clean
+                        ? QStringLiteral("已清理上次遗留的校园网配置: %1").arg(detail)
+                        : QStringLiteral("清理遗留校园网配置未完全成功（请检查网卡配置）: %1")
+                              .arg(detail),
+                    clean ? 0 : 1);
+}
+
+// ============================================================================
+// 看门狗：主线程心跳
+// ============================================================================
+
+void SessionManager::startWatchdog()
+{
+    if (m_watchdogTimer)
+        return;
+    // 2 秒一次心跳：证明"主线程事件循环还在转"。看门狗线程据此判定是否卡死。
+    m_watchdogTimer = new QTimer(this);
+    m_watchdogTimer->setInterval(2000);
+    connect(m_watchdogTimer, &QTimer::timeout, this, []() {
+        HangWatch::heartbeat();
+    });
+    m_watchdogTimer->start();
+    HangWatch::heartbeat();   // 立即给一次心跳，避免启动阶段被误判
+}
+
+void SessionManager::stopWatchdog()
+{
+    if (m_watchdogTimer)
+        m_watchdogTimer->stop();
+    HangWatch::stop();
 }
 
 // ============================================================================
@@ -910,6 +1015,15 @@ void SessionManager::startAutoWait()
     // 只有 autoWaitEnabled 且 auto 模式（= 真的开起了监听）才置位，保证
     // "WaitingForNetwork ⇔ 正在等待（监听或重连排程）"的不变式。
     setState(AppConnectionState::WaitingForNetwork);
+
+    // 等待期间用户很可能改用手机热点上网。清一次残留的校园静态 IP / 校园 DNS /
+    // 环回网关，保证"挂着等重试"不会把整台机器的网络一起拖住。
+    // 节流：startAutoWait 会被多条路径反复调用（每次链路通知/轮询重入），
+    // 不能每次都起一轮 netsh。
+    if (!m_purgeDoneSinceLastWait) {
+        m_purgeDoneSinceLastWait = true;
+        purgeStaleCampusConfig();
+    }
 }
 
 void SessionManager::stopAutoWait()
@@ -1008,6 +1122,11 @@ void SessionManager::scheduleNextRetry(const QString& nightMessage)
                     1);
     // 重试等待同样是可以取消的等待：UI 亮「取消」，点它即停掉重连定时器（用户要求）
     setState(AppConnectionState::WaitingForNetwork);
+    // 【关键】进入"挂着等重试"(尤其夜间等到 6:01) 前，必须把本轮/上次留下的校园静态
+    // IP、校园 DNS 与环回网关清干净：这类等待可能持续整夜，期间用户很可能连手机热点，
+    // 残留配置会让热点"能连上却上不了网"。
+    m_purgeDoneSinceLastWait = true;   // 本轮已清：随后 startAutoWait 不必重复
+    purgeStaleCampusConfig();
     scheduleReconnect();
 }
 

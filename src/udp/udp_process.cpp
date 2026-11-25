@@ -422,10 +422,14 @@ void UdpProcess::onReadyRead() {
                 if (!m_handshakeDone) {
                     m_handshakeDone = true;
                     // 成功路径的唯一可见输出：非调试模式下若不打这条，用户开了开关
-                    // 也无从判断 UDP 会话到底有没有建起来（只有失败会说话）
-                    log(LogLevel::Info,
-                        QStringLiteral("DrCOM UDP 会话已建立，开始心跳保活（%1 秒间隔）")
-                            .arg(DRCOM_HEARTBEAT_INTERVAL / 1000));
+                    // 也无从判断 UDP 会话到底有没有建起来（只有失败会说话）。
+                    // 具体间隔（30 秒）只对排查有意义，放调试日志。
+                    log(LogLevel::Info, QStringLiteral("DrCOM UDP 会话已建立，开始心跳保活"));
+                    if (m_debugLog.load()) {
+                        log(LogLevel::Info,
+                            QStringLiteral("[调试] 心跳间隔 %1 秒")
+                                .arg(DRCOM_HEARTBEAT_INTERVAL / 1000));
+                    }
                     m_heartbeatTimer->start();
                     deferOnline();
                 }

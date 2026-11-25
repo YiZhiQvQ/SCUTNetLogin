@@ -66,6 +66,42 @@ AdapterInfo adapterInfo(const QString& pcapName, const QString& pcapDescription 
 // 通过 MAC 地址查找适配器名（用于 netsh 操作）
 QString adapterNameByMac(const QString& mac);
 
+// 把"任意形式的网卡标识"（GUID / 友好名 / ifIndex 十进制 / pcap 设备名）解析成
+// **netsh 真正接受的**目标名。返回空表示无法解析（调用方必须放弃，绝不能拿空串
+// 调用 netsh—— 实测 `netsh interface ipv4 set address name= dhcp` 不报错也不返回，
+// 会一直挂到超时；而带 GUID 的 name={...} 直接报"文件名、目录名或卷标语法不正确"）。
+//
+// 实测（Windows 11 / netsh ipv4）：name={GUID} → exit 1 失败；name=以太网 → 成功；
+// name=7（ifIndex）→ 成功。因此返回值优先"友好名"，失败回退 ifIndex 十进制串。
+QString netshAdapterName(const QString& anyForm);
+
+// 该标识是否指向环回 / WAN Miniport 等"绝不该被写静态 IP 或 DNS"的接口。
+// 用于在调用 netsh 前拦截——一旦误写，网关/DNS 会落到 Loopback 上并在路由表里
+// 留下 0.0.0.0/0 的持久路由，导致离开校园网（如连手机热点）后仍无法上网。
+bool isUselessNetshTarget(const QString& anyForm);
+
+// 清理"校园静态 IP 残留"（自愈）。
+//
+// 背景（实测故障）：程序在校园网里配过静态 IP + 校园 DNS 后，若恢复 DHCP 的 netsh 调用
+// 失败（历史缺陷：把 {GUID} 当网卡名传给 netsh），这些配置就永久留在机器上：
+//   · 有线网卡保持 10.40.16.57 / 网关 10.40.16.254 / DNS 202.38.193.33；
+//   · 若目标误判到 Loopback，网关/DNS 会挂到环回接口，并在路由表留下
+//     "0.0.0.0/0 → 10.40.16.254 via 127.0.0.1 (metric 1)" 的持久默认路由。
+// 结果：**离开校园网（连手机热点）后依然解析到校园 DNS、把流量送进已经不存在的网关**，
+// 表现为"能连上热点但没法上网"，且重启也不消失（持久路由）。
+//
+// 本函数把"不该再保留校园配置的接口"恢复成 DHCP，并清掉环回接口上的网关：
+//   keepAdapter —— 唯一可以保留校园配置的接口（通常是当前在用的有线网卡），可为空。
+// campusGateway / campusDns —— 只有匹配这些值的接口才会被动（避免误改他人配置）。
+// report —— 追加逐条动作说明（成功/失败都写，便于落盘）。
+// 返回 true 表示没有任何残留（或已全部清理干净）。
+bool purgeStaleCampusIpConfig(const QString& campusGateway, const QStringList& campusDns,
+                              const QString& keepAdapter, QStringList* report);
+
+// 诊断快照：逐条列出 IPv4 默认路由（含持久路由）与各接口 DNS，多行文本。
+// 用于在每次连接/恢复 DHCP 前后落盘，定位"静态 IP / 校园 DNS / 默认路由残留"。
+QString dumpIpConfigSnapshot();
+
 // 枚举所有可用于认证的 Npcap 网卡（自动过滤 loopback / 虚拟机适配器）
 QList<InterfaceEntry> listInterfaces();
 

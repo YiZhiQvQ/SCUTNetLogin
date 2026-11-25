@@ -31,6 +31,7 @@ SOURCES += \
     src/core/session_manager.cpp \
     src/core/connection_builder.cpp \
     src/core/retry_policy.cpp \
+    src/core/watchdog.cpp \
     src/core/byte_utils.cpp \
     src/config/config_manager.cpp \
     src/config/credential.cpp \
@@ -51,6 +52,7 @@ HEADERS += \
     src/core/session_manager.h \
     src/core/connection_builder.h \
     src/core/retry_policy.h \
+    src/core/watchdog.h \
     src/core/byte_utils.h \
     src/config/config_manager.h \
     src/config/credential.h \

@@ -128,14 +128,27 @@
                <item>
                 <widget class="QLabel" name="labelStatusHint">
                  <property name="text"><string>点击下方按钮开始认证</string></property>
+                 <!-- 等待类提示比"点击下方按钮开始认证"长得多：允许换行，并把水平
+                      尺寸策略设为 Expanding，让布局把余量给它，而不是被右侧 spacer
+                      抢走导致句子被截断。 -->
+                 <property name="wordWrap"><bool>true</bool></property>
+                 <property name="sizePolicy">
+                  <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+                   <horstretch>1</horstretch>
+                   <verstretch>0</verstretch>
+                  </sizepolicy>
+                 </property>
                 </widget>
                </item>
               </layout>
              </item>
              <item>
+              <!-- 把剩余水平空间让给提示文字（labelStatusHint 已设为 Expanding），
+                   这里只保留一个最小宽度，避免 spacer 抢走空间导致长句被截断 -->
               <spacer name="statusSpacer">
                <property name="orientation"><enum>Qt::Horizontal</enum></property>
-               <property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property>
+               <property name="sizeType"><enum>QSizePolicy::Fixed</enum></property>
+               <property name="sizeHint" stdset="0"><size><width>0</width><height>20</height></size></property>
               </spacer>
              </item>
             </layout>
@@ -425,7 +438,7 @@
                  </item>
                  <item row="8" column="0" colspan="2">
                   <widget class="QCheckBox" name="checkDrcomHeartbeat">
-                   <property name="text"><string>启用 DrCOM UDP 心跳保活（MiscAlive/MiscInfo/Alive）</string></property>
+                   <property name="text"><string>启用 DrCOM UDP 心跳保活</string></property>
                    <property name="toolTip"><string>认证成功后再建立 DrCOM UDP 会话并每 30 秒发送 Alive 保活。SCUT 现行网络由 802.1X/RADIUS 维持会话，服务器通常不响应 UDP 心跳，故默认关闭；仅当某校区网络确实依赖 DrCOM UDP 保活时才需勾选。「认证服务器」地址只对本功能生效。修改后下次连接生效。</string></property>
                   </widget>
                  </item>
@@ -436,8 +449,20 @@
                   </widget>
                  </item>
                  <item row="9" column="1">
-                  <widget class="QLineEdit" name="editHost">
-                   <property name="text"><string>s.scut.edu.cn</string></property>
+                  <!-- 认证服务器：预置两个校区域名（可编辑，输入自定义值也保留）。
+                       五山校区为 s.scut.edu.cn；国际校区（广州国际校区）为 s2.scut.edu.cn。 -->
+                  <widget class="QComboBox" name="comboHost">
+                   <property name="editable"><bool>true</bool></property>
+                   <property name="toolTip"><string>认证服务器域名。五山校区用 s.scut.edu.cn，国际校区用 s2.scut.edu.cn。仅 DrCOM UDP 心跳保活使用该地址。</string></property>
+                   <!-- 注：真实域名用 itemData 保存（见 MainWindow 构造函数），
+                        显示文案可带"(国际校区)"之类的说明而不污染取值。
+                        uic 不支持 <userData> 属性，故不在此处声明。 -->
+                   <item>
+                    <property name="text"><string>s.scut.edu.cn</string></property>
+                   </item>
+                   <item>
+                    <property name="text"><string>s2.scut.edu.cn（国际校区）</string></property>
+                   </item>
                   </widget>
                  </item>
                 </layout>
@@ -517,7 +542,7 @@
                </item>
                <item>
                 <widget class="QCheckBox" name="checkDebugLog">
-                 <property name="text"><string>启用调试输出（详细连接决策/网卡枚举/帧级hex）</string></property>
+                 <property name="text"><string>启用调试输出</string></property>
                  <property name="toolTip"><string>勾选后在运行日志输出网卡枚举、后端决策依据、EAP/UDP 帧级十六进制与无线门户各阶段参数，便于跨机器排查「一直连有线」等问题。密码绝不会出现在日志中。</string></property>
                 </widget>
                </item>

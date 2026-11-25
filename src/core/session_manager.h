@@ -75,6 +75,26 @@ public:
     // 重连排程（如"距 6:01 再试"）会被整体顺延；唤醒后用墙钟重新评估。
     void onSystemResume();
 
+    // 运行看门狗（防止"界面卡死、进程却还活着"无人知晓）：
+    // 每 2 秒在主线程打一次心跳戳到心跳文件；判活线程（见 SessionManager 的
+    // worker）读取该戳，发现主线程超过阈值没有推进就落一条"主线程疑似卡住"的
+    // 诊断日志（含全部线程的等待链与 pcap/netsh 阶段）。合盖不睡、网卡被电源
+    // 管理挂起时，pcap_open_live/pcap_next_ex 会在内核里永久阻塞——那种状态下
+    // Qt 定时器一并停摆，只能由外部线程记录现场。
+    void startWatchdog();
+    void stopWatchdog();
+
+    // UI 层消息的统一出口（MainWindow::logUiMessage → 这里）。
+    // 为什么需要：MainWindow 自己调 onLogMessage 只更新界面控件，**不会**经过
+    // LogManager 的持久化通道（那条通道接的是本类的 logMessage 信号），于是
+    // "自动连接已开启/正在检测网卡/未检测到网卡/已取消等待"等全部不落盘——排查
+    // "某天软件是否被重启过、有没有自动重连"时日志里查无此事。
+    // 走本函数则同时进界面（信号仍连到 MainWindow::onLogMessage）与当日日志文件。
+    void logFromUi(const QString& message, int level = 0)
+    {
+        emit logMessage(message, level);
+    }
+
 signals:
     void stateChanged(AppConnectionState state);
     void logMessage(const QString& message, int level);
@@ -86,6 +106,7 @@ private slots:
     void onStaticIpDone(int gen);
     void onStaticIpFailed(const QString& error, int gen);
     void onDhcpDone(bool ok, const QString& error);
+    void onPurgeDone(bool clean, const QString& detail);
     void onHeartbeatFailed();
     void onReconnectTimeout();
     void onAutoStartDone(bool ok, const QString& error);
@@ -115,6 +136,9 @@ private:
     QString resolveWiredAdapterName();
     void startWifiAuth();                      // 无线 Portal 认证（刷新 IP/MAC/SSID + 启动进程）
     void restoreDhcp();
+    // 清理上次会话/旧版本遗留的校园静态 IP、校园 DNS 与环回网关残留。
+    // keepAdapter 非空时保留该接口的配置（当前正在用的有线网卡）。
+    void purgeStaleCampusConfig(const QString& keepAdapter = QString());
     void setState(AppConnectionState state);
     // 向 UDP 工作进程投递 stop —— 仅在 UDP 线程确实在运行时投递。心跳开关关闭
     // （默认）时该线程自始至终未启动，投递会留下一个永不执行的事件，等它某天被
@@ -240,6 +264,12 @@ private:
     // --- 自动重连 ---
     QTimer* m_reconnectTimer = nullptr;
     static constexpr int kReconnectIntervalMs = 5 * 60 * 1000;  // 5 分钟
+
+    // 进入等待/重试态时是否已经做过一次"校园配置残留清理"（每次人工连接重置）
+    bool           m_purgeDoneSinceLastWait = false;
+
+    // --- 看门狗（主线程活性 + 关键阶段记录；实现见 core/watchdog.h） ---
+    QTimer* m_watchdogTimer = nullptr;
 
     // 注意：本机网络的心跳超时【不】触发断连/重连。
     // 校园网 DrCOM 服务器经常不回复 UDP 心跳包但网络仍正常，若按心跳超时判定断线

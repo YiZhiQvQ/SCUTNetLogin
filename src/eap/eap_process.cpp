@@ -1,4 +1,5 @@
 #include "eap/eap_process.h"
+#include "core/watchdog.h"
 #include "core/constants.h"
 #include "core/byte_utils.h"
 #include "eap/eapol_packet.h"
@@ -143,8 +144,38 @@ bool EapProcess::openDevice(const QByteArray& ifName, QString* error, QString* b
     if (m_handle)
         closeDevice();
 
+    // 设备存在性预检：配置里保存的网卡可能已被删除/换了 GUID（实测：配置指向的
+    // {2B455667-...} 其实是 "WAN Miniport (Network Monitor)"，而 Realtek 是另一个
+    // GUID）。直接对失效/错误设备调用 pcap_open_live 是历史上"卡死在内核"的入口之一，
+    // 这里先快速判定并给出可执行的告警，绝不带着错误设备硬开。
+    {
+        char ebuf[PCAP_ERRBUF_SIZE] = {};
+        pcap_if_t* devs = nullptr;
+        bool found = false;
+        if (pcap_findalldevs(&devs, ebuf) != -1) {
+            for (pcap_if_t* d = devs; d; d = d->next) {
+                if (ifName == d->name) { found = true; break; }
+            }
+            pcap_freealldevs(devs);
+        }
+        if (!found) {
+            if (error) {
+                *error = QStringLiteral("网卡 %1 当前不存在（Npcap 未枚举到）。"
+                                        "请到「设置」页点「刷新」重新选择网卡后重试。")
+                             .arg(QString::fromLocal8Bit(ifName));
+            }
+            return false;
+        }
+    }
+
     char errbuf[PCAP_ERRBUF_SIZE];
+    // 卡死取证：pcap_open_live 在网卡被电源管理挂起/驱动异常时会**永久阻塞在内核**，
+    // 此时整个 EAP 线程停摆、UI 仍显示"正在认证"，事后无法定位。这里在调用前后
+    // 更新看门狗阶段，卡住时 .hang.log 会直接写明卡在哪块网卡上。
+    HangWatch::setPhase(QStringLiteral("pcap_open_live: %1").arg(QString::fromLatin1(ifName)));
     m_handle = pcap_open_live(ifName.constData(), PCAP_SNAPLEN, 1, PCAP_READ_TIMEOUT, errbuf);
+    HangWatch::setPhase(m_handle ? QStringLiteral("pcap 已打开，等待交换机响应")
+                                : QStringLiteral("pcap 打开失败"));
     if (!m_handle) {
         if (error)
             *error = QString::fromLocal8Bit(errbuf);
@@ -193,6 +224,7 @@ QByteArray EapProcess::receivePacket()
 
     struct pcap_pkthdr* header;
     const u_char* pkt_data;
+    HangWatch::setPhase(QStringLiteral("pcap_next_ex 轮询收包"));
     const int ret = pcap_next_ex(m_handle, &header, &pkt_data);
     if (ret == 1) {
         m_pcapErrorLogged = false;   // 恢复收包，重置错误节流标志
@@ -365,6 +397,14 @@ void EapProcess::start()
 
     QString openError;
     QString bpfWarning;
+    // 卡死取证：pcap_open_live 一旦阻塞，主日志里至少要知道"停在哪一步"。
+    // 但完整 pcap 设备名（\Device\NPF_{GUID}）属于排查细节，只进调试日志；
+    // 界面日志保持一句"正在打开网卡..."即可。
+    log(LogLevel::Info, QStringLiteral("正在打开网卡..."));
+    if (m_debugLog.load())
+        log(LogLevel::Info, QStringLiteral("[调试] pcap 设备: %1").arg(m_config.interfaceName));
+    flushPending();
+
     const bool deviceOk = openDevice(ifName, &openError, &bpfWarning);
 
     locker.relock();

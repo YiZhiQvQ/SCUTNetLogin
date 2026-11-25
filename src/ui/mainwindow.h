@@ -64,6 +64,9 @@ private:
     AppConfig collectCurrentCfg();
     // 「认证服务器」仅在 DrCOM UDP 心跳保活开启时才有意义，关闭时整行置灰
     void updateHostFieldEnabled(bool heartbeatOn);
+    // 认证服务器下拉的取值/回填（真实域名存 itemData，显示文案可带说明）
+    QString currentHost() const;
+    void setHostField(const QString& host);
     void setAutoStartRegistry(bool enable);
     // 自动连接唯一入口（构造函数 / 静默启动共用；守卫在前、日志在后）
     void triggerAutoConnect();
@@ -82,6 +85,10 @@ private:
 
     // 自绘状态指示器（断开=灰环 / 连接中=旋转动画 / 已连接=绿色对勾）
     void updateStatusIcon(AppConnectionState state);
+
+    // UI 侧消息统一出口：经 SessionManager 的 logMessage 信号同时写入界面与当日
+    // 日志文件。直接调 onLogMessage 只更新界面，消息不会落盘（排查时看不到）。
+    void logUiMessage(const QString& message, int level = 0);
 
 private slots:
     void on_btnRefresh_clicked();
