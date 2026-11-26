@@ -355,9 +355,11 @@ QString SessionManager::resolveWiredAdapterName()
         if (!byMac.isEmpty())
             return byMac;
     }
+    // iface.name() 是 LUID 名（"ethernet_32774"），netsh 认，但仍归一化一次：
+    // 统一成友好名，日志和后续排错都更直观。
     const QNetworkInterface iface = Network::findInterface(m_config.interfaceName);
     if (iface.isValid() && !iface.name().isEmpty())
-        return iface.name();
+        return Network::netshAdapterName(iface.name());
     return QString();
 }
 

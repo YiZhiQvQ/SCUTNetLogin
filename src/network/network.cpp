@@ -21,6 +21,7 @@
 #include <vector>
 #include <algorithm>
 #include <QDebug>
+#include <QThread>
 #include <pcap.h>
 
 namespace Network {
@@ -36,6 +37,8 @@ struct RawWin32Adapter {
     // netsh 接受的 name=**。description 在 netsh 里通常认不出，不要混用。
     QString friendlyName;
     DWORD   ifIndex = 0;    // IPv4 接口索引（netsh 也接受十进制索引）
+    // 接口 LUID：GUID/LUID名/ifIndex 之间的换算都以它为中转（netioapi 提供全套转换）
+    IF_LUID luid{};
     // ConvertInterfaceLuidToAlias 的结果，等于"友好名"（如"以太网"、"WLAN 2"）
     QString luidAlias;
     // ConvertInterfaceLuidToName 的结果，形如 "ethernet_32774" / "wlan_32769"。
@@ -120,6 +123,7 @@ static std::vector<RawWin32Adapter> enumerateWin32Adapters()
         ra.description  = QString::fromWCharArray(a->Description);
         ra.friendlyName = a->FriendlyName ? QString::fromWCharArray(a->FriendlyName) : QString();
         ra.ifIndex      = a->IfIndex;
+        ra.luid         = a->Luid;
         ra.ifType       = a->IfType;
         {
             wchar_t aliasBuf[NDIS_IF_MAX_STRING_SIZE + 1] = {};
@@ -182,34 +186,63 @@ QString systemExecutable(const QString& name)
 // findInterface — 将 pcap 设备名 / 描述映射到 Windows QNetworkInterface
 // ============================================================================
 
+// 由 LUID 得到 QNetworkInterface。
+// Qt 6 的 interfaceFromName 接受 "ethernet_32774" 这类 LUID 名和十进制 ifIndex，
+// 但**不接受 {GUID}**（实测 interfaceFromName("{...}") 返回 invalid）。
+// 所以统一先拿到 LUID 名再查。
+static QNetworkInterface interfaceFromLuid(const IF_LUID& luid)
+{
+    wchar_t nameBuf[NDIS_IF_MAX_STRING_SIZE + 1] = {};
+    if (ConvertInterfaceLuidToNameW(&luid, nameBuf, NDIS_IF_MAX_STRING_SIZE + 1) == NO_ERROR) {
+        QNetworkInterface iface = QNetworkInterface::interfaceFromName(QString::fromWCharArray(nameBuf));
+        if (iface.isValid())
+            return iface;
+    }
+    // 兜底：用 ifIndex
+    NET_IFINDEX idx = 0;
+    if (ConvertInterfaceLuidToIndex(&luid, &idx) == NO_ERROR) {
+        QNetworkInterface iface = QNetworkInterface::interfaceFromIndex(static_cast<int>(idx));
+        if (iface.isValid())
+            return iface;
+    }
+    return QNetworkInterface();
+}
+
 QNetworkInterface findInterface(const QString& pcapName,
                                 const QString& pcapDescription)
 {
-    // Strategy 1: extract GUID from pcap device name → QNetworkInterface
+    // 先把 pcap 设备名里的 GUID 取出来（\Device\NPF_{GUID}）。
+    // **注意 Qt 6 的 QNetworkInterface::name() 返回的不是 GUID**，而是
+    // ConvertInterfaceLuidToName 的结果，形如 "ethernet_32774" / "wireless_32769"。
+    // 旧实现拿 iface.name() 与 "{GUID}" 比较，永远不相等 → 有线认证输入映射失败
+    // （日志里的"未能把 pcap 网卡名 ... 映射到系统网卡"就是这么来的）。
+    // 因此统一改为：GUID → LUID → Qt 接口（经 ConvertInterfaceGuidToLuid）。
+    QString ifGuid;
     static const QRegularExpression guidRe(R"(\\Device\\NPF_\{([A-Fa-f0-9\-]+)\})");
-    auto match = guidRe.match(pcapName);
-    if (match.hasMatch()) {
-        const QString guid = QStringLiteral("{") + match.captured(1) + QStringLiteral("}");
-        for (const QNetworkInterface& iface : QNetworkInterface::allInterfaces()) {
-            if (iface.name().compare(guid, Qt::CaseInsensitive) == 0)
-                return iface;
-        }
+    const auto match = guidRe.match(pcapName);
+    if (match.hasMatch())
+        ifGuid = QStringLiteral("{") + match.captured(1) + QStringLiteral("}");
+
+    // Strategy 1: GUID / LUID / ifIndex 三种形式都交给 Win32 枚举统一解析，
+    // 再换算成 Qt 接口（Qt 的 interfaceFromName 只认 LUID 名与 ifIndex，不认 GUID）。
+    const auto adapters = enumerateWin32Adapters();
+    for (const auto& ra : adapters) {
+        const bool hit = (!ifGuid.isEmpty() && ra.guid.compare(ifGuid, Qt::CaseInsensitive) == 0)
+                         || (!ra.luidName.isEmpty()
+                             && ra.luidName.compare(pcapName, Qt::CaseInsensitive) == 0)
+                         || ra.description.compare(pcapName, Qt::CaseInsensitive) == 0;
+        if (!hit)
+            continue;
+        QNetworkInterface iface = interfaceFromLuid(ra.luid);
+        if (iface.isValid())
+            return iface;
     }
 
-    // Strategy 2: match by human-readable description (Qt)
+    // Strategy 2: match by description (pcap 描述 -> Qt humanReadableName)
     if (!pcapDescription.isEmpty()) {
         for (const QNetworkInterface& iface : QNetworkInterface::allInterfaces()) {
             if (iface.humanReadableName().compare(pcapDescription, Qt::CaseInsensitive) == 0)
                 return iface;
-        }
-
-        // Strategy 3: match by description via Win32 GetAdaptersAddresses fallback
-        for (const auto& ra : enumerateWin32Adapters()) {
-            if (ra.description.compare(pcapDescription, Qt::CaseInsensitive) == 0) {
-                QNetworkInterface iface = QNetworkInterface::interfaceFromName(ra.guid);
-                if (iface.isValid())
-                    return iface;
-            }
         }
     }
 
@@ -295,14 +328,18 @@ static QString findAdapterGuidByMac(const QString& normalizedMac)
             return iface.name();
     }
 
-    // Win32 fallback (uses shared enumeration)
+    // Win32 fallback (uses shared enumeration)。
+    // 历史坑：这里曾用 interfaceFromName(ra.guid)，但 Qt 6 不接受 {GUID}（返回
+    // invalid），于是永远退化成返回 GUID —— 而 GUID 又不能直接喂给 netsh。
+    // 现在直接用 LUID 名（"ethernet_32774"），netsh 与 Qt 都认。
     for (const auto& ra : enumerateWin32Adapters()) {
         if (ra.macLen != 6)
             continue;
         const QByteArray macBytes(reinterpret_cast<const char*>(ra.mac), 6);
         if (QString::fromLatin1(macBytes.toHex().toUpper()) == normalizedMac) {
-            QNetworkInterface iface = QNetworkInterface::interfaceFromName(ra.guid);
-            return iface.isValid() ? iface.name() : ra.guid;
+            if (!ra.luidName.isEmpty())
+                return toNetshName(ra.luidName);
+            return ra.guid;
         }
     }
 
@@ -739,12 +776,33 @@ static bool verifyIpv4Config(const QString& netshName, bool expectStatic,
     const QStringList args = { QStringLiteral("interface"), QStringLiteral("ipv4"),
                                QStringLiteral("show"), QStringLiteral("config"),
                                QStringLiteral("name=%1").arg(netshName) };
+
+    // netsh "set address" 返回 0 时，配置**尚未提交到协议栈**：紧接着 show config
+    // 可能还看不到新地址（实测日志：回读到空地址就判定失败，但同一毫秒的现场快照里
+    // 以太网已经是 10.40.16.57 + 校园 DNS —— 说明设置其实成功了，是校验读得太早）。
+    // 因此回读要带退避重试，直到读到的内容"稳定满足期望"或超时。
     QString out;
-    if (!runNetsh(args, &out)) {
-        if (detail)
-            *detail = QStringLiteral("回读配置失败: %1").arg(out);
-        return false;
+    bool readOk = false;
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        if (attempt > 0)
+            QThread::msleep(150);   // 150ms × 5 次 ≈ 0.75s 上限，足够协议栈提交
+        if (!runNetsh(args, &out)) {
+            if (detail)
+                *detail = QStringLiteral("回读配置失败: %1").arg(out);
+            return false;
+        }
+        readOk = true;
+        // 提前退出：已能读到期望的关键字段就不再等（DHCP 场景只看 DHCP 是否启用）
+        if (!expectStatic) {
+            if (out.contains(QStringLiteral("DHCP enabled"), Qt::CaseInsensitive)
+                || out.contains(QStringLiteral("DHCP 已启用")))
+                break;
+        } else if (!ip.isEmpty() && out.contains(ip)) {
+            break;
+        }
     }
+    if (!readOk)
+        return false;
 
     auto valueOf = [&out](const QString& key, const QString& keyZh) -> QString {
         for (const QString& line : out.split(QLatin1Char('\n'))) {
