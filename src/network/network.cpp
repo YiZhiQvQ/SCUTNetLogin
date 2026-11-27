@@ -95,11 +95,16 @@ static std::vector<RawWin32Adapter> enumerateWin32Adapters()
 {
     std::vector<RawWin32Adapter> result;
     ULONG bufLen = 0;
+    // 必须带 GAA_FLAG_INCLUDE_GATEWAYS：默认（flags=0）时
+    // PIP_ADAPTER_ADDRESSES::FirstGatewayAddress **恒为 NULL**，网关列表永远是空的，
+    // 于是"静态 IP 校验"会把已经设好的网关读成 [] 并误判失败
+    // （日志：网关实际为[] 期望[10.40.16.254]，而同一时刻路由表里明明有该默认路由）。
+    const ULONG flags = GAA_FLAG_INCLUDE_GATEWAYS;
     // 首次调用只为取所需缓冲区大小：正常返回 ERROR_BUFFER_OVERFLOW 并写入 bufLen；
     // 无任何适配器时返回 NO_ERROR（合法，不是错误）。
     // 失败必须留下痕迹——返回空表会让 ethernetLinkUp() 判为"无线缆"，auto 模式下
     // 静默改走无线，是极难自查的"为什么一直选无线"。
-    const ULONG rcSize = GetAdaptersAddresses(AF_INET, 0, nullptr, nullptr, &bufLen);
+    const ULONG rcSize = GetAdaptersAddresses(AF_INET, flags, nullptr, nullptr, &bufLen);
     if (rcSize == NO_ERROR)
         return result;                       // 本机确实没有适配器
     if (rcSize != ERROR_BUFFER_OVERFLOW || bufLen == 0) {
@@ -111,7 +116,7 @@ static std::vector<RawWin32Adapter> enumerateWin32Adapters()
     std::vector<BYTE> buf(bufLen);
     PIP_ADAPTER_ADDRESSES adapters =
         reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
-    const ULONG rc = GetAdaptersAddresses(AF_INET, 0, nullptr, adapters, &bufLen);
+    const ULONG rc = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &bufLen);
     if (rc != NO_ERROR) {
         qWarning().noquote() << "GetAdaptersAddresses 枚举失败, rc=" << rc
                              << "（将按'无有线网卡'处理）";
@@ -583,11 +588,14 @@ QString dumpIpConfigSnapshot()
 
     // ② 每块网卡的 IPv4 地址与 DNS —— 静态残留 / 校园 DNS 挂在错误接口上一眼可见
     ULONG bufLen = 0;
-    if (GetAdaptersAddresses(AF_INET, 0, nullptr, nullptr, &bufLen) == ERROR_BUFFER_OVERFLOW
+    // 与 enumerateWin32Adapters 保持一致带上 GAA_FLAG_INCLUDE_GATEWAYS：虽然本段只用
+    // 地址与 DNS，但 flags 不一致会让"同一份数据、两个快照不同"在排错时产生歧义。
+    const ULONG gaaFlags = GAA_FLAG_INCLUDE_GATEWAYS;
+    if (GetAdaptersAddresses(AF_INET, gaaFlags, nullptr, nullptr, &bufLen) == ERROR_BUFFER_OVERFLOW
         && bufLen > 0) {
         std::vector<BYTE> buf(bufLen);
         auto* adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
-        if (GetAdaptersAddresses(AF_INET, 0, nullptr, adapters, &bufLen) == NO_ERROR) {
+        if (GetAdaptersAddresses(AF_INET, gaaFlags, nullptr, adapters, &bufLen) == NO_ERROR) {
             for (auto* a = adapters; a; a = a->Next) {
                 const QString name = a->FriendlyName ? QString::fromWCharArray(a->FriendlyName)
                                                      : QStringLiteral("(无)");
@@ -775,11 +783,40 @@ bool runNetsh(const QStringList& args, QString* errorMsg)
 //   ① 文本标签随系统语言变化（"IP Address" / "IP 地址" / 其他语言版本）；
 //   ② 无地址时 netsh 直接不输出该行，与"读取失败"无法区分；
 //   ③ netsh set 返回后配置是否已提交到协议栈取决于时序，文本层可能滞后。
-// 因此改为直接查 Win32 结构化数据（GetAdaptersAddresses + registry 的 EnableDHCP），
-// 与语言无关、没有时序滞后，并且带退避重试等 DHCP/地址状态稳定。
-//
-// 说明：这里用 registry 的 EnableDHCP 判断"是否静态"而非 GetAdaptersAddresses 的
-// DHCP 标志——后者在"已设静态但仍持有旧 DHCP 租约"的过渡态下不可靠。
+// 因此改为直接查 Win32 结构化数据（GetAdaptersAddresses），与语言无关、无文本滞后，
+// 并带退避重试等待地址/DNS/网关状态稳定。
+// 该 LUID 对应的接口上，是否存在"默认路由 → gw"。
+// 网关生效的最终判据：只要路由表里有这条 0.0.0.0/0，网关就一定在工作。
+// 单纯依赖适配器的 FirstGatewayAddress 不够稳（它受 GAA flags 与过渡态影响）。
+static bool hasDefaultRouteVia(const IF_LUID& luid, const QString& gw)
+{
+    if (gw.isEmpty())
+        return false;
+    PMIB_IPFORWARD_TABLE2 fwd = nullptr;
+    if (GetIpForwardTable2(AF_INET, &fwd) != NO_ERROR || !fwd)
+        return false;
+
+    bool found = false;
+    for (ULONG i = 0; i < fwd->NumEntries && !found; ++i) {
+        const MIB_IPFORWARD_ROW2& row = fwd->Table[i];
+        if (row.DestinationPrefix.PrefixLength != 0)
+            continue;                                   // 只看默认路由
+        if (row.DestinationPrefix.Prefix.si_family != AF_INET)
+            continue;
+        if (row.InterfaceLuid.Value != luid.Value)
+            continue;
+        const auto* nh = reinterpret_cast<const sockaddr_in*>(&row.NextHop);
+        if (!nh)
+            continue;
+        char ipb[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, &nh->sin_addr, ipb, sizeof(ipb));
+        if (QString::fromLatin1(ipb) == gw)
+            found = true;
+    }
+    FreeMibTable(fwd);
+    return found;
+}
+
 static bool verifyIpv4ConfigImpl(const QString& netshName, bool expectStatic,
                              const QString& ip, const QString& mask,
                              const QString& gw, const QString& dns1,
@@ -824,26 +861,32 @@ static bool verifyIpv4ConfigImpl(const QString& netshName, bool expectStatic,
         }
 
         bad.clear();
-        const bool hasWantedIp = cur->ipv4.contains(ip);
         if (expectStatic) {
-            if (ip.isEmpty() || hasWantedIp)
-                ;
-            else
+            if (!ip.isEmpty() && !cur->ipv4.contains(ip)) {
                 bad << QStringLiteral("地址实际为[%1] 期望[%2]")
                            .arg(cur->ipv4.join(QLatin1Char(',')), ip);
-            if (!gw.isEmpty() && !cur->gateways.contains(gw))
-                bad << QStringLiteral("网关实际为[%1] 期望[%2]")
-                           .arg(cur->gateways.join(QLatin1Char(',')), gw);
-            if (!dns1.isEmpty() && !cur->dns.contains(dns1))
+            }
+            if (!gw.isEmpty()) {
+                // 网关有两个可信来源，任一命中即算生效：
+                //   ① 适配器自身的 FirstGatewayAddress（需 GAA_FLAG_INCLUDE_GATEWAYS）；
+                //   ② 路由表里该接口上指向该网关的默认路由。
+                // ②是最终判据——只要默认路由在，网关就是生效的。实测出现过适配器
+                // 网关为空、但路由表明确有该默认路由的情况（见 .hang.log 快照）。
+                const bool gwOnAdapter = cur->gateways.contains(gw);
+                if (!gwOnAdapter && !hasDefaultRouteVia(cur->luid, gw)) {
+                    bad << QStringLiteral("网关实际为[%1] 期望[%2]")
+                               .arg(cur->gateways.join(QLatin1Char(',')), gw);
+                }
+            }
+            if (!dns1.isEmpty() && !cur->dns.contains(dns1)) {
                 bad << QStringLiteral("DNS 实际为[%1] 期望含[%2]")
                            .arg(cur->dns.join(QLatin1Char(',')), dns1);
-        } else {
-            // 期望 DHCP：网关/DNS 不能残留校园配置
-            if (!cur->ipv4.isEmpty()
-                && !cur->ipv4.first().startsWith(QLatin1String("169.254"))) {
-                // 有真实地址也可能是 DHCP 分配的，不算失败；只看网关是否清掉
             }
-            if (!gw.isEmpty() && cur->gateways.contains(gw))
+        } else {
+            // 期望 DHCP：校园网关/DNS 不能残留
+            const bool gwStillThere = cur->gateways.contains(gw)
+                                      || (!gw.isEmpty() && hasDefaultRouteVia(cur->luid, gw));
+            if (!gw.isEmpty() && gwStillThere)
                 bad << QStringLiteral("仍残留网关[%1]").arg(gw);
             if (!dns1.isEmpty() && cur->dns.contains(dns1))
                 bad << QStringLiteral("仍残留 DNS[%1]").arg(dns1);
