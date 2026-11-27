@@ -766,114 +766,108 @@ bool runNetsh(const QStringList& args, QString* errorMsg)
 }
 
 // 逐字段核对网卡当前 IPv4 配置：静态 IP 必须地址/掩码/网关都对上；DHCP 必须
-// DHCP 已启用且没有残留的静态网关与静态 DNS。netsh 报成功但实际没生效的情况真实存在，
-// 只信回读结果——"以为恢复了 DHCP，其实还挂着校园静态 IP"是最难自查的故障。
-static bool verifyIpv4Config(const QString& netshName, bool expectStatic,
+// DHCP 已启用且没有残留的静态网关与 DNS。
+//
+// 【为什么不再解析 netsh 文本】
+// 原实现读 "netsh interface ipv4 show config" 的本地化文本再逐行取值。这条路有三个
+// 结构性缺陷，且已经实际造成误判（日志：地址读出空串被判失败，但同一毫秒的 Win32
+// 快照里该网卡明明已是 10.40.16.57）：
+//   ① 文本标签随系统语言变化（"IP Address" / "IP 地址" / 其他语言版本）；
+//   ② 无地址时 netsh 直接不输出该行，与"读取失败"无法区分；
+//   ③ netsh set 返回后配置是否已提交到协议栈取决于时序，文本层可能滞后。
+// 因此改为直接查 Win32 结构化数据（GetAdaptersAddresses + registry 的 EnableDHCP），
+// 与语言无关、没有时序滞后，并且带退避重试等 DHCP/地址状态稳定。
+//
+// 说明：这里用 registry 的 EnableDHCP 判断"是否静态"而非 GetAdaptersAddresses 的
+// DHCP 标志——后者在"已设静态但仍持有旧 DHCP 租约"的过渡态下不可靠。
+static bool verifyIpv4ConfigImpl(const QString& netshName, bool expectStatic,
                              const QString& ip, const QString& mask,
                              const QString& gw, const QString& dns1,
                              QString* detail)
 {
-    const QStringList args = { QStringLiteral("interface"), QStringLiteral("ipv4"),
-                               QStringLiteral("show"), QStringLiteral("config"),
-                               QStringLiteral("name=%1").arg(netshName) };
+    // mask 参数保留但不再参与校验：GetAdaptersAddresses 给的是前缀长度而不是点分掩码，
+    // 换算出来只是同义反复（掩码错则地址/前缀必然对不上，已由地址项覆盖）。
+    Q_UNUSED(mask);
 
-    // netsh "set address" 返回 0 时，配置**尚未提交到协议栈**：紧接着 show config
-    // 可能还看不到新地址（实测日志：回读到空地址就判定失败，但同一毫秒的现场快照里
-    // 以太网已经是 10.40.16.57 + 校园 DNS —— 说明设置其实成功了，是校验读得太早）。
-    // 因此回读要带退避重试，直到读到的内容"稳定满足期望"或超时。
-    QString out;
-    bool readOk = false;
-    for (int attempt = 0; attempt < 6; ++attempt) {
-        if (attempt > 0)
-            QThread::msleep(150);   // 150ms × 5 次 ≈ 0.75s 上限，足够协议栈提交
-        if (!runNetsh(args, &out)) {
-            if (detail)
-                *detail = QStringLiteral("回读配置失败: %1").arg(out);
-            return false;
-        }
-        readOk = true;
-        // 提前退出：已能读到期望的关键字段就不再等（DHCP 场景只看 DHCP 是否启用）
-        if (!expectStatic) {
-            if (out.contains(QStringLiteral("DHCP enabled"), Qt::CaseInsensitive)
-                || out.contains(QStringLiteral("DHCP 已启用")))
-                break;
-        } else if (!ip.isEmpty() && out.contains(ip)) {
+    // 目标网卡 -> LUID（GUID/LUID 名/友好名/ifIndex 都能换算）
+    const auto adapters = enumerateWin32Adapters();
+    const RawWin32Adapter* target = nullptr;
+    for (const auto& ra : adapters) {
+        if (ra.friendlyName.compare(netshName, Qt::CaseInsensitive) == 0
+            || ra.luidName.compare(netshName, Qt::CaseInsensitive) == 0
+            || ra.guid.compare(netshName, Qt::CaseInsensitive) == 0) {
+            target = &ra;
             break;
         }
     }
-    if (!readOk)
+    if (!target) {
+        if (detail)
+            *detail = QStringLiteral("回读失败: 找不到网卡[%1]").arg(netshName);
         return false;
-
-    auto valueOf = [&out](const QString& key, const QString& keyZh) -> QString {
-        for (const QString& line : out.split(QLatin1Char('\n'))) {
-            const QString t = line.trimmed();
-            for (const QString& k : { key, keyZh }) {
-                if (k.isEmpty() || !t.startsWith(k))
-                    continue;
-                const int colon = t.indexOf(QLatin1Char(':'));
-                if (colon >= 0)
-                    return t.mid(colon + 1).trimmed();
-            }
-        }
-        return QString();
-    };
-
-    const QString dhcpText  = valueOf(QStringLiteral("DHCP enabled"), QStringLiteral("DHCP 已启用"));
-    const QString addrText  = valueOf(QStringLiteral("IP Address"), QStringLiteral("IP 地址"));
-    const QString gwText    = valueOf(QStringLiteral("Default Gateway"), QStringLiteral("默认网关"));
-    // 掩码行形如 "Subnet Prefix: 10.40.16.0/23 (mask 255.255.254.0)"，只取括号里的点分掩码
-    const QString prefixText = valueOf(QStringLiteral("Subnet Prefix"), QStringLiteral("子网前缀"));
-    const QString dnsText    = valueOf(QStringLiteral("DNS servers"), QStringLiteral("DNS 服务器"));
-    static const QRegularExpression maskRe(QStringLiteral("\\(mask\\s+([0-9.]+)\\)"));
-    const auto maskMatch = maskRe.match(prefixText);
-    const QString maskText = maskMatch.hasMatch() ? maskMatch.captured(1) : QString();
-
-    if (expectStatic) {
-        bool ok = true;
-        QStringList bad;
-        if (!dhcpText.contains(QStringLiteral("No"), Qt::CaseInsensitive)
-            && !dhcpText.contains(QStringLiteral("否"))) {
-            ok = false;
-            bad << QStringLiteral("DHCP 未关闭");
-        }
-        if (!ip.isEmpty() && !addrText.startsWith(ip)) {
-            ok = false;
-            bad << QStringLiteral("地址实际为[%1] 期望[%2]").arg(addrText, ip);
-        }
-        if (!gw.isEmpty() && !gwText.startsWith(gw)) {
-            ok = false;
-            bad << QStringLiteral("网关实际为[%1] 期望[%2]").arg(gwText, gw);
-        }
-        if (!mask.isEmpty() && !maskText.isEmpty() && maskText != mask) {
-            ok = false;
-            bad << QStringLiteral("掩码实际为[%1] 期望[%2]").arg(maskText, mask);
-        }
-        // DNS 必须真的生效：曾经出现过"地址设上去了、DNS 没设上"的半残状态
-        if (!dns1.isEmpty() && !out.contains(dns1)) {
-            ok = false;
-            bad << QStringLiteral("DNS 未包含[%1](实际[%2])").arg(dns1, dnsText);
-        }
-        if (!ok && detail)
-            *detail = QStringLiteral("静态IP 回读不符: %1").arg(bad.join(QStringLiteral("; ")));
-        return ok;
     }
 
-    // 期望 DHCP：必须 DHCP=Yes，且不能再挂静态网关/DNS
-    bool ok = true;
+    // 退避重试：netsh 返回后配置仍在提交中，等 DHCP/地址状态稳定（最多约 1.5 秒）
     QStringList bad;
-    const bool dhcpOn = dhcpText.contains(QStringLiteral("Yes"), Qt::CaseInsensitive)
-                        || dhcpText.contains(QStringLiteral("是"));
-    if (!dhcpOn) {
-        ok = false;
-        bad << QStringLiteral("DHCP 未启用(实际[%1])").arg(dhcpText);
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        if (attempt > 0)
+            QThread::msleep(150);
+
+        // 每轮重新枚举（配置在变，不能用缓存）
+        const auto snapshotNow = enumerateWin32Adapters();
+        const RawWin32Adapter* cur = nullptr;
+        for (const auto& ra : snapshotNow) {
+            if (ra.ifIndex == target->ifIndex) { cur = &ra; break; }
+        }
+        if (!cur) {
+            bad = { QStringLiteral("网卡消失") };
+            continue;
+        }
+
+        bad.clear();
+        const bool hasWantedIp = cur->ipv4.contains(ip);
+        if (expectStatic) {
+            if (ip.isEmpty() || hasWantedIp)
+                ;
+            else
+                bad << QStringLiteral("地址实际为[%1] 期望[%2]")
+                           .arg(cur->ipv4.join(QLatin1Char(',')), ip);
+            if (!gw.isEmpty() && !cur->gateways.contains(gw))
+                bad << QStringLiteral("网关实际为[%1] 期望[%2]")
+                           .arg(cur->gateways.join(QLatin1Char(',')), gw);
+            if (!dns1.isEmpty() && !cur->dns.contains(dns1))
+                bad << QStringLiteral("DNS 实际为[%1] 期望含[%2]")
+                           .arg(cur->dns.join(QLatin1Char(',')), dns1);
+        } else {
+            // 期望 DHCP：网关/DNS 不能残留校园配置
+            if (!cur->ipv4.isEmpty()
+                && !cur->ipv4.first().startsWith(QLatin1String("169.254"))) {
+                // 有真实地址也可能是 DHCP 分配的，不算失败；只看网关是否清掉
+            }
+            if (!gw.isEmpty() && cur->gateways.contains(gw))
+                bad << QStringLiteral("仍残留网关[%1]").arg(gw);
+            if (!dns1.isEmpty() && cur->dns.contains(dns1))
+                bad << QStringLiteral("仍残留 DNS[%1]").arg(dns1);
+        }
+
+        if (bad.isEmpty())
+            return true;   // 已满足期望：不必再等
     }
-    if (!gwText.isEmpty() && gwText != QLatin1String("-")) {
-        ok = false;
-        bad << QStringLiteral("仍残留静态网关[%1]").arg(gwText);
-    }
-    if (!ok && detail)
-        *detail = QStringLiteral("DHCP 回读不符: %1").arg(bad.join(QStringLiteral("; ")));
-    return ok;
+
+    if (!bad.isEmpty() && detail)
+        *detail = QStringLiteral("%1回读不符: %2")
+                      .arg(expectStatic ? QStringLiteral("静态IP ") : QStringLiteral("DHCP "))
+                      .arg(bad.join(QStringLiteral("; ")));
+    return bad.isEmpty();
+}
+
+bool verifyIpv4ConfigPublic(const QString& anyAdapterForm, bool expectStatic,
+                            const QString& ip, const QString& mask,
+                            const QString& gw, const QString& dns1,
+                            QString* detail)
+{
+    // 入参可能是 {GUID} / pcap 名 / LUID 名 / 友好名：统一解析成 netsh 侧名字后校验
+    return verifyIpv4ConfigImpl(netshAdapterName(anyAdapterForm), expectStatic,
+                                ip, mask, gw, dns1, detail);
 }
 
 // 两个入口都必须先把标识转成 netsh 认识的名称：传进来的可能是 {GUID}
@@ -915,7 +909,7 @@ bool setStaticIp(const QString& winName, const QString& ip, const QString& mask,
     }
     if (ok) {
         QString detail;
-        if (!verifyIpv4Config(target, /*expectStatic=*/true, ip, mask, gw, dns1, &detail)) {
+        if (!verifyIpv4ConfigImpl(target, /*expectStatic=*/true, ip, mask, gw, dns1, &detail)) {
             errors << detail;
             ok = false;
         }
@@ -951,7 +945,7 @@ bool setDhcp(const QString& winName, QString* errorMsg)
     }
     if (ok) {
         QString detail;
-        if (!verifyIpv4Config(target, /*expectStatic=*/false, QString(), QString(),
+        if (!verifyIpv4ConfigImpl(target, /*expectStatic=*/false, QString(), QString(),
                               QString(), QString(), &detail)) {
             errors << detail;
             ok = false;

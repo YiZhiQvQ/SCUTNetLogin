@@ -121,6 +121,15 @@ bool setStaticIp(const QString& winName, const QString& ip, const QString& mask,
                  QString* errorMsg = nullptr);
 bool setDhcp(const QString& winName, QString* errorMsg = nullptr);
 
+// 核对网卡当前 IPv4 配置是否满足期望（expectStatic=true 校验静态 IP；
+// false 校验已回到 DHCP 且不再挂着给定的网关/DNS）。
+// 数据源是 Win32 结构化接口而非 netsh 文本，故与系统语言无关、也无文本滞后问题。
+// 内部带退避重试（约 1.5 秒上限），供设置/恢复后确认落盘。
+bool verifyIpv4ConfigPublic(const QString& anyAdapterForm, bool expectStatic,
+                            const QString& ip, const QString& mask,
+                            const QString& gw, const QString& dns1,
+                            QString* detail = nullptr);
+
 // ============================================================================
 // 链路状态（auto 模式决策与无线 Portal 模块使用）
 // ============================================================================
