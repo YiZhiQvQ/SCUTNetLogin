@@ -185,12 +185,25 @@ constexpr size_t DRCOM_MISC_ALIVE_SIZE = 8;
 constexpr int EAP_RETRANSMIT_INTERVAL = 3000;
 // "等待交换机响应" 日志节流：每重发多少次才记录一条（默认每 5 次 ≈ 15s 一条）
 constexpr int RETRANSMIT_LOG_INTERVAL = 5;
-// pcap 收包超时 (ms) — 必须为 1ms，配合 20ms 轮询计时器使用
+// pcap 收包超时 (ms) — 必须为 1ms，配合轮询计时器使用
 constexpr int PCAP_READ_TIMEOUT = 1;
+
+// EAP 轮询间隔 (ms)。
+// 握手期：需要尽快响应交换机，20ms 是实测下"1-2 秒完成认证"的前提。
+constexpr int EAP_POLL_INTERVAL_HANDSHAKE_MS = 20;
+// 稳态（已认证）：仍必须保留轮询——交换机会定期发 EAP-Request/Identity 探活，
+// 不回应就会被踢下线。但不需要 50Hz，200ms 有 5-10 倍余量（802.1X 的 EAP-Request
+// 重传超时为秒级），可把唤醒频率降低 10 倍，有助于 CPU 进入更深 C-state。
+constexpr int EAP_POLL_INTERVAL_STEADY_MS = 200;
 
 // 单轮收包上限：工作线程持锁处理网络输入，必须设上限——否则异常/恶意洪泛会让
 // 锁长时间不释放，重发判定与状态信号全部停摆。余量留给下一轮 20ms 轮询 / readyRead。
 constexpr int EAP_MAX_PACKETS_PER_ROUND     = 64;   // EapProcess::drainPackets
+
+// 卡死看门狗心跳定时器间隔 (ms)，须与 HangWatch::kTickMs 一致
+constexpr int WATCHDOG_TICK_MS = 2000;
+// 等待网络就绪的轮询间隔 (ms)：Wi-Fi 关联状态无廉价系统通知，只能短轮询
+constexpr int AUTO_WAIT_TICK_MS = 2000;
 constexpr int DRCOM_MAX_DATAGRAMS_PER_ROUND = 64;   // UdpProcess::onReadyRead
 
 // ============================================================================
@@ -208,6 +221,11 @@ constexpr const char* DEFAULT_DNS = "202.38.193.33";
 
 // netsh 命令超时 (ms)
 constexpr int NETSH_TIMEOUT = 15000;
+// netsh 超时后 kill 的等待时间 (ms)：只保证进程被回收，不需要长等待
+constexpr int NETSH_KILL_WAIT_MS = 2000;
+// 静态 IP / DHCP 回读校验的重试间隔 (ms)：netsh set 返回后配置仍在提交到协议栈，
+// 需要退避重试等待状态稳定（总上限由重试次数决定，当前约 1.5 秒）
+constexpr int IP_VERIFY_RETRY_MS = 150;
 // 自动联动（有线↔无线）执行前的链路稳定等待：插拔网线/端口就绪常有数百 ms 抖动，
 // 立即切换还会在链路上电前发出 802.1X 探测被拒（实测"认证被拒绝"）。
 // 5 秒（原为 3 秒）：链路检测改为接口变更通知后，计时起点从"轮询发现插入"（滞后

@@ -121,17 +121,17 @@ bool setStaticIp(const QString& winName, const QString& ip, const QString& mask,
                  QString* errorMsg = nullptr);
 bool setDhcp(const QString& winName, QString* errorMsg = nullptr);
 
+// 检查网卡是否开启了会与 Npcap 冲突的省电特性（Realtek 的 Power Saving Mode /
+// Green Ethernet / EEE / Gigabit Lite 等）。这些特性会在链路空闲时关断收发，
+// 与 Npcap 的内核过滤驱动冲突时会让 pcap_activate 永久阻塞，进而导致进程无法被
+// 终止（连 TerminateProcess 都返回拒绝访问，只能重启系统）。
+// 返回告警文本（空 = 未发现风险）。仅读取 registry，无副作用。
+QString nicPowerSavingWarning(const QString& anyAdapterForm);
+
 // 核对网卡当前 IPv4 配置是否满足期望（expectStatic=true 校验静态 IP；
 // false 校验已回到 DHCP 且不再挂着给定的网关/DNS）。
 // 数据源是 Win32 结构化接口而非 netsh 文本，故与系统语言无关、也无文本滞后问题。
 // 内部带退避重试（约 1.5 秒上限），供设置/恢复后确认落盘。
-// 检查网卡是否开启了会与 Npcap 冲突的省电特性（Realtek 的 Power Saving Mode /
-// Green Ethernet 等）。这些特性会在链路空闲时关断收发，与 Npcap 的内核过滤驱动
-// 冲突时会让 pcap_activate 永久阻塞，进而导致进程无法被终止（连 TerminateProcess
-// 都返回拒绝访问，只能重启系统）。
-// 返回告警文本（空 = 未发现风险）。仅读取 registry，无副作用。
-QString nicPowerSavingWarning(const QString& anyAdapterForm);
-
 bool verifyIpv4ConfigPublic(const QString& anyAdapterForm, bool expectStatic,
                             const QString& ip, const QString& mask,
                             const QString& gw, const QString& dns1,

@@ -179,7 +179,7 @@ void NetworkWorker::doSetAutoStart(bool enable)
         proc.start();
         if (!proc.waitForFinished(NETSH_TIMEOUT)) {
             proc.kill();
-            proc.waitForFinished(2000);
+            proc.waitForFinished(NETSH_KILL_WAIT_MS);
             emit autoStartDone(false, QStringLiteral("schtasks 命令超时"));
             return false;
         }

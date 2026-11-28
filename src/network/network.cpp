@@ -587,47 +587,18 @@ QString dumpIpConfigSnapshot()
     }
 
     // ② 每块网卡的 IPv4 地址与 DNS —— 静态残留 / 校园 DNS 挂在错误接口上一眼可见
-    ULONG bufLen = 0;
-    // 与 enumerateWin32Adapters 保持一致带上 GAA_FLAG_INCLUDE_GATEWAYS：虽然本段只用
-    // 地址与 DNS，但 flags 不一致会让"同一份数据、两个快照不同"在排错时产生歧义。
-    const ULONG gaaFlags = GAA_FLAG_INCLUDE_GATEWAYS;
-    if (GetAdaptersAddresses(AF_INET, gaaFlags, nullptr, nullptr, &bufLen) == ERROR_BUFFER_OVERFLOW
-        && bufLen > 0) {
-        std::vector<BYTE> buf(bufLen);
-        auto* adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
-        if (GetAdaptersAddresses(AF_INET, gaaFlags, nullptr, adapters, &bufLen) == NO_ERROR) {
-            for (auto* a = adapters; a; a = a->Next) {
-                const QString name = a->FriendlyName ? QString::fromWCharArray(a->FriendlyName)
-                                                     : QStringLiteral("(无)");
-                QStringList ips;
-                for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
-                    if (u->Address.lpSockaddr
-                        && u->Address.lpSockaddr->sa_family == AF_INET) {
-                        const auto* sin = reinterpret_cast<const sockaddr_in*>(
-                            u->Address.lpSockaddr);
-                        char ipb[INET_ADDRSTRLEN] = {};
-                        inet_ntop(AF_INET, &sin->sin_addr, ipb, sizeof(ipb));
-                        ips << QString::fromLatin1(ipb);
-                    }
-                }
-                QStringList dns;
-                for (auto* d = a->FirstDnsServerAddress; d; d = d->Next) {
-                    if (d->Address.lpSockaddr
-                        && d->Address.lpSockaddr->sa_family == AF_INET) {
-                        const auto* sin = reinterpret_cast<const sockaddr_in*>(
-                            d->Address.lpSockaddr);
-                        char dnsb[INET_ADDRSTRLEN] = {};
-                        inet_ntop(AF_INET, &sin->sin_addr, dnsb, sizeof(dnsb));
-                        dns << QString::fromLatin1(dnsb);
-                    }
-                }
-                out << QStringLiteral("[网卡] %1 (idx=%2) IP=[%3] DNS=[%4]")
-                           .arg(name)
-                           .arg(a->IfIndex)
-                           .arg(ips.join(QLatin1Char(',')))
-                           .arg(dns.join(QLatin1Char(',')));
-            }
-        }
+    //
+    // 复用 enumerateWin32Adapters()，不再在这里重复一遍 GetAdaptersAddresses 与
+    // unicast/DNS 提取。此前这段与枚举函数各写一份，历史上正是"改了一处漏了另一处"
+    // 的直接来源（GAA_FLAG_INCLUDE_GATEWAYS 那次就漏了这个快照路径）。
+    for (const auto& ra : enumerateWin32Adapters()) {
+        const QString name = ra.friendlyName.isEmpty() ? QStringLiteral("(无)")
+                                                       : ra.friendlyName;
+        out << QStringLiteral("[网卡] %1 (idx=%2) IP=[%3] DNS=[%4]")
+                   .arg(name)
+                   .arg(ra.ifIndex)
+                   .arg(ra.ipv4.join(QLatin1Char(',')))
+                   .arg(ra.dns.join(QLatin1Char(',')));
     }
 
     return out.join(QLatin1Char('\n'));
@@ -739,7 +710,7 @@ bool runNetsh(const QStringList& args, QString* errorMsg)
         // 显式终止挂起的 netsh（QProcess 析构也会杀，但显式 kill 保证
         // 错误信息可读且不依赖析构时序）
         proc.kill();
-        proc.waitForFinished(2000);
+        proc.waitForFinished(NETSH_KILL_WAIT_MS);
         if (errorMsg) {
             *errorMsg = QString("netsh 命令超时 (%1 秒): %2")
                             .arg(NETSH_TIMEOUT / 1000)
@@ -847,7 +818,7 @@ static bool verifyIpv4ConfigImpl(const QString& netshName, bool expectStatic,
     QStringList bad;
     for (int attempt = 0; attempt < 10; ++attempt) {
         if (attempt > 0)
-            QThread::msleep(150);
+            QThread::msleep(IP_VERIFY_RETRY_MS);
 
         // 每轮重新枚举（配置在变，不能用缓存）
         const auto snapshotNow = enumerateWin32Adapters();
@@ -1032,90 +1003,85 @@ bool verifyIpv4ConfigPublic(const QString& anyAdapterForm, bool expectStatic,
                                 ip, mask, gw, dns1, detail);
 }
 
+// 静态 IP / DHCP 两个入口的公共骨架：解析目标 → 拒绝无效目标 → 逐条执行 netsh →
+// 回读校验 → 汇总错误。原实现里 setStaticIp 与 setDhcp 各写一遍这五步（约 45 行 x 2），
+// 任何一处改动都必须同步另一处，是典型的"改一处漏一处"来源。
+static bool applyIpv4Config(const QString& winName,
+                            const QVector<QStringList>& addressDnsCommands,
+                            bool expectStatic,
+                            const QString& ip, const QString& mask,
+                            const QString& gw, const QString& dns1,
+                            const QString& actionLabel,
+                            QString* errorMsg)
+{
+    const QString target = netshAdapterName(winName);
+    // 目标为空或指向环回/WAN Miniport：绝不能写。写错会把网关/DNS 挂到假接口上，
+    // 在路由表里留下持久默认路由，离开校园网后依然无法上网。
+    if (target.isEmpty() || isUselessNetshTarget(winName)) {
+        if (errorMsg) {
+            *errorMsg = QStringLiteral("拒绝向无效目标[%1]%2（解析结果[%3]）")
+                            .arg(winName, actionLabel, target);
+        }
+        return false;
+    }
+
+    QStringList errors;
+    bool ok = true;
+    for (const QStringList& cmd : addressDnsCommands) {
+        // 命令模板里的 {target} 占位符在调用处替换（各命令参数位置不同）
+        QStringList resolved;
+        resolved.reserve(cmd.size());
+        for (const QString& arg : cmd) {
+            resolved << (arg == QLatin1String("{target}") ? target : arg);
+        }
+        QString err;
+        if (!runNetshTolerant(resolved, &err)) {
+            qWarning().noquote() << err;
+            errors << err;
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        QString detail;
+        if (!verifyIpv4ConfigImpl(target, expectStatic, ip, mask, gw, dns1, &detail)) {
+            errors << detail;
+            ok = false;
+        }
+    }
+    if (!ok && errorMsg)
+        *errorMsg = errors.join(QLatin1Char('\n'));
+    return ok;
+}
 // 两个入口都必须先把标识转成 netsh 认识的名称：传进来的可能是 {GUID}
 // （adapterNameByMac 的历史返回值）或 pcap 设备名。
 bool setStaticIp(const QString& winName, const QString& ip, const QString& mask,
                  const QString& gw, const QString& dns1, const QString& dns2,
                  QString* errorMsg)
 {
-    const QString target = netshAdapterName(winName);
-    // 目标为空或指向环回/WAN Miniport：绝不能写。写错会把网关/DNS 挂到假接口上，
-    // 在路由表里留下持久默认路由，离开校园网后依然上不了网。
-    if (target.isEmpty() || isUselessNetshTarget(winName)) {
-        if (errorMsg) {
-            *errorMsg = QStringLiteral("拒绝向无效目标[%1]写入静态IP（解析结果[%2]）")
-                            .arg(winName, target);
-        }
-        return false;
-    }
+    // 命令模板里的 {target} 由 applyIpv4Config 解析成 netsh 目标名后替换。
+    QVector<QStringList> commands = {
+        { "interface", "ip", "set", "address", "{target}", "static", ip, mask, gw },
+        { "interface", "ip", "set", "dns",     "{target}", "static", dns1 },
+    };
+    // 备用 DNS 为可选：为空时不再追加（否则 netsh 会收到空参数）
+    if (!dns2.isEmpty())
+        commands.append({ "interface", "ip", "add", "dns", "{target}", dns2 });
 
-    QStringList errors;
-    bool ok = true;
-    QString err;
-    if (!runNetshTolerant({"interface", "ip", "set", "address", target, "static", ip, mask, gw}, &err)) {
-        qWarning().noquote() << err;
-        errors << err;
-        ok = false;
-    }
-    if (!runNetshTolerant({"interface", "ip", "set", "dns", target, "static", dns1}, &err)) {
-        qWarning().noquote() << err;
-        errors << err;
-        ok = false;
-    }
-    if (!dns2.isEmpty()) {
-        if (!runNetshTolerant({"interface", "ip", "add", "dns", target, dns2}, &err)) {
-            qWarning().noquote() << err;
-            errors << err;
-            ok = false;   // 备用 DNS 失败同样是"配置未完整生效"，不能对外报成功
-        }
-    }
-    if (ok) {
-        QString detail;
-        if (!verifyIpv4ConfigImpl(target, /*expectStatic=*/true, ip, mask, gw, dns1, &detail)) {
-            errors << detail;
-            ok = false;
-        }
-    }
-    if (!ok && errorMsg)
-        *errorMsg = errors.join('\n');
-    return ok;
+    return applyIpv4Config(winName, commands, /*expectStatic=*/true,
+                           ip, mask, gw, dns1,
+                           QStringLiteral("写入静态IP"), errorMsg);
 }
 
 bool setDhcp(const QString& winName, QString* errorMsg)
 {
-    const QString target = netshAdapterName(winName);
-    if (target.isEmpty() || isUselessNetshTarget(winName)) {
-        if (errorMsg) {
-            *errorMsg = QStringLiteral("拒绝向无效目标[%1]恢复 DHCP（解析结果[%2]）")
-                            .arg(winName, target);
-        }
-        return false;
-    }
-
-    QStringList errors;
-    bool ok = true;
-    QString err;
-    if (!runNetshTolerant({"interface", "ip", "set", "address", target, "dhcp"}, &err)) {
-        qWarning().noquote() << err;
-        errors << err;
-        ok = false;
-    }
-    if (!runNetshTolerant({"interface", "ip", "set", "dns", target, "dhcp"}, &err)) {
-        qWarning().noquote() << err;
-        errors << err;
-        ok = false;
-    }
-    if (ok) {
-        QString detail;
-        if (!verifyIpv4ConfigImpl(target, /*expectStatic=*/false, QString(), QString(),
-                              QString(), QString(), &detail)) {
-            errors << detail;
-            ok = false;
-        }
-    }
-    if (!ok && errorMsg)
-        *errorMsg = errors.join('\n');
-    return ok;
+    const QVector<QStringList> commands = {
+        { "interface", "ip", "set", "address", "{target}", "dhcp" },
+        { "interface", "ip", "set", "dns",     "{target}", "dhcp" },
+    };
+    return applyIpv4Config(winName, commands, /*expectStatic=*/false,
+                           QString(), QString(), QString(), QString(),
+                           QStringLiteral("恢复 DHCP"), errorMsg);
 }
 
 // ============================================================================

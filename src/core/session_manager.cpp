@@ -790,7 +790,7 @@ void SessionManager::startWatchdog()
         return;
     // 2 秒一次心跳：证明"主线程事件循环还在转"。看门狗线程据此判定是否卡死。
     m_watchdogTimer = new QTimer(this);
-    m_watchdogTimer->setInterval(2000);
+    m_watchdogTimer->setInterval(WATCHDOG_TICK_MS);
     connect(m_watchdogTimer, &QTimer::timeout, this, []() {
         HangWatch::heartbeat();
     });
@@ -1017,7 +1017,7 @@ void SessionManager::startAutoWait()
     ensureLinkMonitor();
     if (!m_autoWaitTimer) {
         m_autoWaitTimer = new QTimer(this);
-        m_autoWaitTimer->setInterval(2000);   // 就绪检测：短轮询，Wi-Fi/网线一就绪即触发
+        m_autoWaitTimer->setInterval(AUTO_WAIT_TICK_MS);   // 就绪检测：短轮询，Wi-Fi/网线一就绪即触发
         connect(m_autoWaitTimer, &QTimer::timeout, this, &SessionManager::onAutoWaitTick);
     }
     m_autoWaitRunning = true;   // 通知与轮询共用同一"运行中"开关（见头文件注释）
