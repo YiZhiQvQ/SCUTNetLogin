@@ -18,6 +18,7 @@
 - **DrCOM UDP 心跳保活** — 可选，默认关闭，仅有线
 - **Fluent 风格界面** — 圆角卡片布局、自绘状态指示器（断开=灰环 / 连接中=蓝色旋转 / 已连接=绿色对勾）
 - **日志持久化** — 按日轮转写入 `log/SCUTNetLogin_YYYY-MM-DD.log`
+- **卡死取证** — 独立看门狗线程监视主线程心跳，超过 15 秒无心跳即写 `log/SCUTNetLogin_YYYY-MM-DD.hang.log`，记录卡住阶段、线程清单与网络快照
 
 ## 环境要求
 
@@ -55,6 +56,45 @@
 - **有线认证的时机**：静态 IP 配置、网卡与本机 IP/MAC 都在**真正发起有线认证的时刻**才确定。因此「先启动程序、后插网线」时，首次自动认证就会带上正确的静态 IP 与地址，不需要手动再点一次「连接」。
 - **未勾选「启动后自动连接」时不检测网卡**：启动阶段不做任何网卡枚举/自动填充；首次切到「设置」页、点「刷新」或点「连接」时才检测（点「连接」会在检测完成后自动继续）。Wi-Fi 侧启动期同样不做任何探测。
 - **无线认证细节**：程序自动跟随校园网网关重定向（AC 302 → 门户 a79.htm → Dr.COM eportal）模拟浏览器登录，并轮询官方 `online_list` 接口确认上线后才判定「已连接」。各校区门户地址/参数会自动动态发现，无需手工配置。
+
+### 进程卡死且任务管理器关不掉
+
+**现象**：程序界面无响应，任务管理器「结束任务」也没反应，只能重启系统。
+
+**原因**：早期版本用 `pcap_open_live` 打开网卡。网卡驱动侧一旦阻塞（Realtek 的 Power Saving Mode / Green Ethernet / EEE 在链路空闲时关断收发通路，与 Npcap 的内核过滤驱动冲突），该调用会**永久阻塞在内核态**——而卡在内核的线程无法被终止，进程对象因此无法回收（`TerminateProcess` 返回 `ERROR_ACCESS_DENIED`）。
+
+> 这不是权限问题，用管理员身份也无法结束。这是 Windows 的硬性约束。
+
+**已修复**（1.7+）：改用 `pcap_create` + `pcap_activate`，后者返回明确错误码而非无限等待，最坏情况变为"报错并重试"。
+
+**建议一并关闭网卡省电**（消除根因）。以**管理员身份**运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\close-nic-powersaving.ps1
+```
+
+脚本会关闭所有物理网卡的 Power Saving Mode / Green Ethernet / Advanced EEE / EEE / Gigabit Lite，并回读验证。程序在认证前也会自动检测这些项，发现风险时在日志中提示。
+
+### 连手机热点无法上网
+
+**原因**：恢复 DHCP 的 netsh 调用失败时，校园静态 IP、校园 DNS 以及误写到**环回接口**上的网关会残留在机器上。环回上的网关会在路由表留下 `0.0.0.0/0` 的**持久默认路由**（metric=1），优先级高于手机热点，于是"热点连上了却打不开网页"，且重启也不消失。
+
+**已修复**：网卡名统一解析（netsh 不认 `{GUID}` 形式）、设置后回读校验、并在启动/进入等待/恢复失败时自动清理残留。若仍怀疑有残留，可手动检查：
+
+```powershell
+netsh interface ipv4 show config name="Loopback Pseudo-Interface 1"   # 应无网关/DNS
+Get-NetRoute -DestinationPrefix 0.0.0.0/0                              # 不应有指向校园网关的 via 127.0.0.1
+```
+
+### 切到电池时程序自己退出
+
+**原因**：自启动任务由 `schtasks /create /sc onlogon` 生成的默认模板包含 `StopIfGoingOnBatteries=true`，任务计划会在切换到电池时**直接终止进程**。**这不是崩溃**——WER 与事件日志里查不到任何 Application Error。
+
+**已修复**（1.6+）：改用 XML 定义任务并显式关闭 `StopIfGoingOnBatteries` / `DisallowStartIfOnBatteries` / `StopOnIdleEnd` / `ExecutionTimeLimit`，存量旧任务会在下次保存配置时自动迁移。可用以下命令确认：
+
+```powershell
+schtasks /query /tn "SCUTNetLogin_AutoStart" /xml | Select-String "Batteries|TimeLimit|IdleEnd"
+```
 
 ## 配置项
 
@@ -151,6 +191,8 @@ powershell -File tools\installer\build_installer.ps1
 
 协议纯函数（封包构造 / 帧解析 / 校验和 / 加解密 / 字节工具 / 连接校验 / 服务器通知解析 / 配置回环 / 无线门户解析与接入后端决策）有 QtTest 回归护栏；无线侧覆盖 a79.htm 变量解析、`online_list` 查询构造、GBK 错误文案分类（密码错误→不可重试）、会话归属校验、SSID 白名单。用例见 `tests/tst_packets.cpp`，夹具 `tests/wifi_fixtures.h` 为实测抓取的真实协议响应样本。
 
+当前共 55 个用例。覆盖范围说明：已覆盖的都是**纯函数**（无 I/O、无 pthread/网络依赖）；涉及 pcap、netsh、HTTP 的模块目前靠手工验证清单（见 `docs/manual_test_checklist.md`）。
+
 ```
 cd tests
 qmake tst_packets.pro && nmake release
@@ -175,7 +217,11 @@ src/
 ├── eap/                        # 有线 802.1X：EAPOL 握手、帧构造/解析、服务器通知解析
 ├── udp/                        # DrCOM UDP 心跳：包构造 + 校验和（有线）
 ├── wifi/                       # 无线 Portal：认证工作线程、门户解析（纯函数）、wlanapi 封装
-├── network/                    # 网卡枚举、适配器查找、netsh 封装、有线链路检测
+├── network/                    # 网卡枚举、netsh 封装、有线链路检测
+│   ├── network_adapter         # 适配器枚举与标识解析（GUID/LUID名/友好名/ifIndex）
+│   ├── network_link            # LinkMonitor 接口变更通知 + 链路状态判定 + 缓存枚举
+│   ├── network                 # netsh 执行、IPv4 配置校验、残留自愈、诊断快照
+│   └── network_internal.h      # 模块内部共享声明（不对外暴露）
 └── log/                        # 日志文件持久化（按日轮转）
 res/                            # style.qss、resources.qrc、图标
 tools/installer/                # 安装包：Installer.cs + 构建脚本
