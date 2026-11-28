@@ -365,6 +365,12 @@ QString SessionManager::resolveWiredAdapterName()
 
 void SessionManager::startAuth(bool restartEap)
 {
+    // 阶段标记必须在这里就更新：此前只有在"设置静态IP"和 pcap 各阶段会 setPhase，
+    // 中间这段（线程启动 + setConfig）没有任何标记。2026-11-29 00:58 的卡死正落在
+    // 这个空档里，.hang.log 只能报出更早的"设置静态IP"，无法区分是卡在 netsh 还是
+    // 卡在认证准备。补上标记后，同类卡死可直接读出停在哪一步。
+    HangWatch::setPhase(QStringLiteral("启动认证线程"));
+
     // 惰性启动认证线程（首次认证时拉起，此后保持运行直至进程退出）
     if (!m_eapThread.isRunning())
         m_eapThread.start();
@@ -377,11 +383,14 @@ void SessionManager::startAuth(bool restartEap)
     emit logMessage(QStringLiteral("开始802.1X认证..."), 0);
 
     // 注意顺序：setConfig 为同步直调，先于 invokeMethod("start"/"restart") 的
-    // 排队事件完成，因此工作线程处理启动槽时必然已拿到最新配置
+    // 排队事件完成，因此工作线程处理启动槽时必然已拿到最新配置。
+    // setConfig 只用配置锁（不与 pcap 轮询锁互斥），不会在这里死等（见 eap_process.h）。
+    HangWatch::setPhase(QStringLiteral("投递认证配置"));
     m_eapProcess->setConfig(m_config);
     if (m_drcomHeartbeat)
         m_udpProcess->setConfig(m_config);
 
+    HangWatch::setPhase(QStringLiteral("等待认证线程启动"));
     QMetaObject::invokeMethod(m_eapProcess, restartEap ? "restart" : "start", Qt::QueuedConnection);
 }
 

@@ -134,6 +134,18 @@ private:
     QString     m_lastError;       // pcap_open_live 失败时的错误信息
 
     QMutex m_mutex;
+
+    // 配置快照专用锁（与 m_mutex 无关）。
+    //
+    // 为什么必须分开：主线程 SessionManager::startAuth() 要**同步**调用 setConfig()
+    // 投递新配置，而 m_mutex 会被工作线程在 onPollTimeout() 里整轮持有（其中包含
+    // drainPackets() -> pcap_next_ex 这类可能阻塞的内核调用）。一旦 pcap 卡住，
+    // 主线程的 setConfig() 就会永远等这把锁 —— 表现为：
+    //   「开始802.1X认证...」之后主线程再无进展、连 invokeMethod("start") 都发不出去，
+    //   而看门狗记录到的阶段还停在更早的「设置静态IP」上（因为阶段更新也卡在
+    //   同一线程）。这正是 2026-11-29 00:58 那次卡死的形态。
+    // 配置只在 start()/restart() 时取一次快照，用独立的锁即可，不必与轮询锁互斥。
+    mutable QMutex m_configMutex;
 };
 
 #endif // EAP_PROCESS_H

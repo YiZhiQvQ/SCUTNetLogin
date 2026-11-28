@@ -83,7 +83,9 @@ EapProcess::~EapProcess()
 
 void EapProcess::setConfig(AuthConfig config)
 {
-    QMutexLocker locker(&m_mutex);
+    // 只取配置锁：绝不能等 m_mutex —— 那把锁可能被工作线程在 pcap 轮询里长期持有，
+    // 主线程在这里同步等待会直接造成"开始认证后再无日志"的死等（见头文件注释）。
+    QMutexLocker locker(&m_configMutex);
     m_config = std::move(config);
 }
 
@@ -250,7 +252,12 @@ QByteArray EapProcess::receivePacket()
 
 std::vector<uint8_t> EapProcess::buildEapolFrame(uint8_t eapolType, uint16_t eapolBodyLen) const
 {
-    return EapolPacket::buildEapolFrame(m_config.localMac, eapolType, eapolBodyLen);
+    uint8_t mac[6];
+    {
+        QMutexLocker cfgLock(&m_configMutex);
+        memcpy(mac, m_config.localMac, 6);
+    }
+    return EapolPacket::buildEapolFrame(mac, eapolType, eapolBodyLen);
 }
 
 // ============================================================================
@@ -279,7 +286,12 @@ void EapProcess::sendEapolLogoff()
 void EapProcess::sendEapResponse(uint8_t eapType, uint8_t requestId,
                                   const QByteArray& payload, QByteArray& lastPacket)
 {
-    auto frame = EapolPacket::buildEapResponseFrame(m_config.localMac, m_switchMac,
+    uint8_t srcMac[6];
+    {
+        QMutexLocker cfgLock(&m_configMutex);
+        memcpy(srcMac, m_config.localMac, 6);
+    }
+    auto frame = EapolPacket::buildEapResponseFrame(srcMac, m_switchMac,
                                                      eapType, requestId, payload);
     if (frame.empty()) {
         // 封包被拒（载荷超长，见 buildEapResponseFrame 的长度兜底）：不发畸形帧，
@@ -389,10 +401,15 @@ void EapProcess::start()
     m_stopRequested = false;
     resetSessionState();
 
-    // 设备名在锁内取好；随后必须放开 m_mutex 再开设备——pcap_open_live() 是可能
-    // 阻塞数百 ms 的系统调用，而主线程的 setConfig()（SessionManager::startAuth
-    // 同步直调）需要同一把锁，锁内开设备会让 UI 干等。
-    const QByteArray ifName = m_config.interfaceName.toLocal8Bit();
+    // 设备名从配置快照里取（用配置锁，与 m_mutex 无关）；随后放开 m_mutex 再开设备
+    // —— pcap_open_live() 是可能阻塞数百 ms 的系统调用，锁内开设备会让主线程干等。
+    QByteArray ifName;
+    bool debugLogOn = false;
+    {
+        QMutexLocker cfgLock(&m_configMutex);
+        ifName     = m_config.interfaceName.toLocal8Bit();
+        debugLogOn = m_debugLog.load();
+    }
     locker.unlock();
 
     QString openError;
@@ -401,8 +418,10 @@ void EapProcess::start()
     // 但完整 pcap 设备名（\Device\NPF_{GUID}）属于排查细节，只进调试日志；
     // 界面日志保持一句"正在打开网卡..."即可。
     log(LogLevel::Info, QStringLiteral("正在打开网卡..."));
-    if (m_debugLog.load())
+    if (debugLogOn) {
+        QMutexLocker cfgLock(&m_configMutex);
         log(LogLevel::Info, QStringLiteral("[调试] pcap 设备: %1").arg(m_config.interfaceName));
+    }
     flushPending();
 
     const bool deviceOk = openDevice(ifName, &openError, &bpfWarning);
@@ -594,7 +613,17 @@ bool EapProcess::processEapPacket(const QByteArray& packet)
 
 void EapProcess::handleEapRequest(const EAPHeader& hdr, const QByteArray& payload)
 {
-    QByteArray userUtf8 = m_config.username.toUtf8();
+    // 配置字段在轮询线程里读取：主线程可能正在 setConfig() 写入，必须经配置锁取快照，
+    // 否则是数据竞争（QString/QByteArray 的隐式共享引用计数会被并发改写）。
+    QByteArray userUtf8;
+    QString    password;
+    uint8_t    localIp[4] = {};
+    {
+        QMutexLocker cfgLock(&m_configMutex);
+        userUtf8 = m_config.username.toUtf8();
+        password = m_config.password;
+        memcpy(localIp, m_config.localIp, 4);
+    }
 
     switch (hdr.type) {
     case EAP_TYPE_IDENTITY: {
@@ -604,7 +633,7 @@ void EapProcess::handleEapRequest(const EAPHeader& hdr, const QByteArray& payloa
             m_currentState = AuthState::SendingIdentity;
         }
         // 已认证状态下也静默回应（心跳检测），不写日志避免刷屏
-        QByteArray idPayload = EapolPacket::buildIdentityPayload(userUtf8, m_config.localIp);
+        QByteArray idPayload = EapolPacket::buildIdentityPayload(userUtf8, localIp);
         sendEapResponse(EAP_TYPE_IDENTITY, hdr.id, idPayload, m_lastIdentityPacket);
         break;
     }
@@ -625,10 +654,10 @@ void EapProcess::handleEapRequest(const EAPHeader& hdr, const QByteArray& payloa
                 break;
             }
             const QByteArray challenge = payload.mid(1, md5Size);
-            m_md5Result = EapolPacket::calculateMD5(hdr.id, m_config.password, challenge);
+            m_md5Result = EapolPacket::calculateMD5(hdr.id, password, challenge);
 
             QByteArray md5Payload = EapolPacket::buildMd5ChallengePayload(
-                m_md5Result, userUtf8, m_config.localIp);
+                m_md5Result, userUtf8, localIp);
             sendEapResponse(EAP_TYPE_MD5_CHALLENGE, hdr.id, md5Payload, m_lastMd5Packet);
         } else if (m_debugLog.load()) {
             log(LogLevel::Info, QStringLiteral("[调试] MD5 挑战载荷为空，已忽略"));
