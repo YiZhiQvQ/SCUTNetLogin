@@ -40,6 +40,8 @@ SOURCES += \
     src/eap/notification_parser.cpp \
     src/udp/udp_process.cpp \
     src/network/network.cpp \
+    src/network/network_adapter.cpp \
+    src/network/network_link.cpp \
     src/udp/drcom_packet.cpp \
     src/eap/eapol_packet.cpp \
     src/log/log_manager.cpp \
@@ -63,6 +65,7 @@ HEADERS += \
     src/core/protocol.h \
     src/core/log_level.h \
     src/network/network.h \
+    src/network/network_internal.h \
     src/core/constants.h \
     src/udp/drcom_packet.h \
     src/eap/eapol_packet.h \
