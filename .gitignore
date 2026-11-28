@@ -83,5 +83,10 @@ needcommit.md
 # git 自身
 .gitignore
 
-# wifi 协议研究文档（副产物，不入库）
-docs/
+# docs 目录整体作为 wifi 协议研究副产物，不入库。
+# 注意 git 的规则：一旦目录被忽略，目录内的 ! 例外规则不会再被求值。
+# 因此改为"忽略目录内容但保留目录本身"，再逐个放行需要入库的文档。
+docs/*
+# 面向贡献者的架构与测试文档需要入库
+!docs/architecture.md
+!docs/manual_test_checklist.md
