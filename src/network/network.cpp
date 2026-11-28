@@ -903,6 +903,125 @@ static bool verifyIpv4ConfigImpl(const QString& netshName, bool expectStatic,
     return bad.isEmpty();
 }
 
+// 读取网卡驱动注册表里的省电相关键，判断是否存在与 Npcap 冲突的风险。
+//
+// 背景（实测故障）：Realtek PCIe GbE 的 "Power Saving Mode" 与 "Green Ethernet"
+// 开启时，网卡会在链路空闲时进入低功耗、关断部分收发通路。Npcap 是内核级过滤驱动，
+// 其 pcap_activate 在这种情况下会**永久阻塞在内核态**，导致：
+//   · EAP 线程无法返回，整个连接流程停摆；
+//   · 进程无法被终止 —— TerminateProcess 返回 ERROR_ACCESS_DENIED，
+//     任务管理器"结束任务"无任何反应，最终只能重启系统。
+// 因此这里主动检测并提示用户，把"事后无从下手"变成"事前可规避"。
+QString nicPowerSavingWarning(const QString& anyAdapterForm)
+{
+    // 必须用 netshAdapterName() 而不是 toNetshName()：调用方传进来的常是 pcap
+    // 设备名（\Device\NPF_{GUID}），toNetshName 不解析这个前缀，会原样返回，
+    // 于是下面的 GUID 匹配永远失败、检测恒为"未检出风险"。
+    const QString canonical = netshAdapterName(anyAdapterForm);
+    if (canonical.isEmpty())
+        return QString();
+
+    const auto adapters = enumerateWin32Adapters();
+    QString guid;
+    for (const auto& ra : adapters) {
+        if (ra.friendlyName.compare(canonical, Qt::CaseInsensitive) == 0
+            || ra.luidName.compare(canonical, Qt::CaseInsensitive) == 0) {
+            guid = ra.guid;
+            break;
+        }
+    }
+    if (guid.isEmpty())
+        return QString();
+
+    HKEY classKey = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SYSTEM\\CurrentControlSet\\Control\\Class\\"
+                      L"{4d36e972-e325-11ce-bfc1-08002be10318}",
+                      0, KEY_READ, &classKey) != ERROR_SUCCESS) {
+        return QString();
+    }
+
+    QStringList risky;
+    for (DWORD i = 0;; ++i) {
+        wchar_t subName[64] = {};
+        DWORD nameLen = 63;
+        if (RegEnumKeyExW(classKey, i, subName, &nameLen, nullptr, nullptr, nullptr, nullptr)
+            != ERROR_SUCCESS) {
+            break;
+        }
+        HKEY instKey = nullptr;
+        if (RegOpenKeyExW(classKey, subName, 0, KEY_READ, &instKey) != ERROR_SUCCESS)
+            continue;
+
+        wchar_t instId[128] = {};
+        DWORD idSize = sizeof(instId);
+        DWORD type = 0;
+        // 花括号方向必须归一：GetAdaptersAddresses 的 AdapterName **不带**花括号
+        // （34A9BD27-...），而注册表 NetCfgInstanceId **带**花括号（{34A9BD27-...}）。
+        // 直接比字符串永不相等 —— 这正是检测恒为"未检出风险"的原因。
+        auto stripBraces = [](QString s) {
+            s = s.trimmed();
+            if (s.startsWith(QLatin1Char('{')) && s.endsWith(QLatin1Char('}')))
+                s = s.mid(1, s.size() - 2);
+            return s;
+        };
+        const bool isTarget =
+            RegQueryValueExW(instKey, L"NetCfgInstanceId", nullptr, &type,
+                             reinterpret_cast<LPBYTE>(instId), &idSize) == ERROR_SUCCESS
+            && stripBraces(guid).compare(stripBraces(QString::fromWCharArray(instId)),
+                                          Qt::CaseInsensitive) == 0;
+
+        if (isTarget) {
+            struct Check { const wchar_t* key; const char* label; };
+            static const Check checks[] = {
+                { L"PowerSavingMode",     "Power Saving Mode" },
+                { L"EnableGreenEthernet", "Green Ethernet" },
+                { L"*EEE",                "Energy Efficient Ethernet" },
+                { L"AdvancedEEE",         "Advanced EEE" },
+                { L"PowerDownPll",        "Power Down PLL" },
+            };
+            for (const auto& c : checks) {
+                // 注意：Realtek 驱动把这些开关存成 **REG_SZ（字符串 "1"/"0"）**，
+                // 而不是 REG_DWORD（实测 GetValueKind = String）。原实现只认
+                // REG_DWORD，导致检测恒为空 —— 明明开着省电却报"未检出风险"。
+                // 这里两种类型都接受，按文本比较 "1"。
+                DWORD type2 = 0;
+                BYTE buf[64] = {};
+                DWORD size = sizeof(buf);
+                if (RegQueryValueExW(instKey, c.key, nullptr, &type2, buf, &size) != ERROR_SUCCESS)
+                    continue;
+
+                bool enabled = false;
+                if (type2 == REG_DWORD && size >= sizeof(DWORD)) {
+                    DWORD v = 0;
+                    memcpy(&v, buf, sizeof(v));
+                    enabled = (v == 1);
+                } else {
+                    const QString sv = QString::fromWCharArray(
+                        reinterpret_cast<const wchar_t*>(buf)).trimmed();
+                    enabled = (sv == QLatin1String("1")
+                               || sv.compare(QLatin1String("true"), Qt::CaseInsensitive) == 0
+                               || sv.compare(QLatin1String("enabled"), Qt::CaseInsensitive) == 0);
+                }
+                if (enabled)
+                    risky << QString::fromLatin1(c.label);
+            }
+            RegCloseKey(instKey);
+            break;
+        }
+        RegCloseKey(instKey);
+    }
+    RegCloseKey(classKey);
+
+    if (risky.isEmpty())
+        return QString();
+
+    return QStringLiteral("网卡 [%1] 开启了 %2 —— 这类省电特性会与 Npcap 的内核驱动冲突，"
+                          "可能让打开网卡的操作永久阻塞（此时程序无法被结束，只能重启系统）。"
+                          "建议在「设备管理器 → 网络适配器 → 属性 → 高级」中把这些项设为 Disabled。")
+        .arg(canonical, risky.join(QStringLiteral(" / ")));
+}
+
 bool verifyIpv4ConfigPublic(const QString& anyAdapterForm, bool expectStatic,
                             const QString& ip, const QString& mask,
                             const QString& gw, const QString& dns1,

@@ -4,6 +4,7 @@
 #include "core/byte_utils.h"
 #include "eap/eapol_packet.h"
 #include "eap/notification_parser.h"
+#include "network/network.h"
 #include <QThread>
 #include <QDebug>
 #include <pcap.h>
@@ -170,19 +171,64 @@ bool EapProcess::openDevice(const QByteArray& ifName, QString* error, QString* b
         }
     }
 
-    char errbuf[PCAP_ERRBUF_SIZE];
-    // 卡死取证：pcap_open_live 在网卡被电源管理挂起/驱动异常时会**永久阻塞在内核**，
-    // 此时整个 EAP 线程停摆、UI 仍显示"正在认证"，事后无法定位。这里在调用前后
-    // 更新看门狗阶段，卡住时 .hang.log 会直接写明卡在哪块网卡上。
-    HangWatch::setPhase(QStringLiteral("pcap_open_live: %1").arg(QString::fromLatin1(ifName)));
-    m_handle = pcap_open_live(ifName.constData(), PCAP_SNAPLEN, 1, PCAP_READ_TIMEOUT, errbuf);
-    HangWatch::setPhase(m_handle ? QStringLiteral("pcap 已打开，等待交换机响应")
-                                : QStringLiteral("pcap 打开失败"));
-    if (!m_handle) {
+    // ========================================================================
+    // 用 pcap_create + pcap_activate 取代 pcap_open_live。
+    //
+    // 为什么必须换：pcap_open_live 把所有步骤（创建/设置/激活）揉成一次调用，
+    // 期间一旦网卡驱动侧阻塞（Realtek 的 Power Saving Mode / Green Ethernet
+    // 会在空闲时关链路，与 Npcap 的内核过滤驱动冲突），该调用会**永久阻塞在内核态**。
+    // 此时进程无法被终止 —— 实测 TerminateProcess 返回 ERROR_ACCESS_DENIED，
+    // 任务管理器"结束任务"毫无反应，只能重启系统。这是最严重的一类故障。
+    //
+    // pcap_activate 会返回明确的错误码（而不是无限等待），且我们可以：
+    //   · 用 pcap_set_timeout 限定读超时；
+    //   · 在激活前把网卡从省电状态唤醒（见下方 noteNicPowerSaving）；
+    //   · 拿到具体错误分类，把"永久卡死"变成"可重试的失败"。
+    // ========================================================================
+    // 先给出可执行的规避提示（省电特性是"卡死且杀不掉"的已知触发条件）。
+    // 只在有风险时输出，且每会话一次，避免刷屏。
+    {
+        static QString lastWarned;
+        const QString warn = Network::nicPowerSavingWarning(QString::fromLatin1(ifName));
+        if (!warn.isEmpty() && warn != lastWarned) {
+            lastWarned = warn;
+            log(LogLevel::Warning, warn);
+            flushPending();
+        }
+    }
+
+    char errbuf[PCAP_ERRBUF_SIZE] = {};
+    pcap_t* handle = pcap_create(ifName.constData(), errbuf);
+    if (!handle) {
         if (error)
-            *error = QString::fromLocal8Bit(errbuf);
+            *error = QStringLiteral("pcap_create 失败: %1").arg(QString::fromLocal8Bit(errbuf));
+        HangWatch::setPhase(QStringLiteral("pcap 打开失败"));
         return false;
     }
+
+    pcap_set_snaplen(handle, PCAP_SNAPLEN);
+    pcap_set_promisc(handle, 1);
+    pcap_set_timeout(handle, PCAP_READ_TIMEOUT);
+    // immediate mode：不等内核缓冲凑满就交付。EAPOL 是低频小包，攒包模式会让
+    // 握手响应延迟数十毫秒，偶发拖到超时被交换机判为无响应。
+    pcap_set_immediate_mode(handle, 1);
+
+    HangWatch::setPhase(QStringLiteral("pcap_activate: %1").arg(QString::fromLatin1(ifName)));
+    const int actRc = pcap_activate(handle);
+    if (actRc < 0) {
+        // 负值 = 错误；正值 = 警告（如已处于混杂模式，仍可用）
+        const QString detail = QString::fromLocal8Bit(pcap_geterr(handle));
+        pcap_close(handle);
+        if (error) {
+            *error = QStringLiteral("打开网卡失败(%1): %2")
+                         .arg(actRc, 0, 10)
+                         .arg(detail.isEmpty() ? QStringLiteral("未知错误") : detail);
+        }
+        HangWatch::setPhase(QStringLiteral("pcap 打开失败"));
+        return false;
+    }
+    m_handle = handle;
+    HangWatch::setPhase(QStringLiteral("pcap 已打开，等待交换机响应"));
 
     struct bpf_program fp;
     if (pcap_compile(m_handle, &fp, "ether proto 0x888e", 1, PCAP_NETMASK_UNKNOWN) == 0) {
