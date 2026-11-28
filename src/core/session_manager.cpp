@@ -1229,116 +1229,138 @@ int SessionManager::msecsToNextRetry() const
     return RetryPolicy::nextRetryDelayMs(QDateTime::currentDateTime(), kReconnectIntervalMs);
 }
 
+// 重连到点处理。原为 112 行的单函数（状态守卫 + 夜间重判 + 后端复判 + 三条分派路径
+// 全揉在一起）。现按"预检 -> 决策 -> 分派"拆为职责单一的辅助函数，便于单独阅读与测试。
 void SessionManager::onReconnectTimeout()
 {
-    // 重连排程可能在两种状态下到点：Disconnected（含人工断开前的残留）与
-    // WaitingForNetwork（重试等待/就绪等待——UI 显示为可取消的等待）
-    if (m_state != AppConnectionState::Disconnected
-        && m_state != AppConnectionState::WaitingForNetwork)
+    if (!reconnectPreflight())
         return;
-    stopAutoWait();   // 正式重试：停掉就绪监听（触发后由相应路径重新按需启动）
-
-    // 防御分支：定时器可能按旧间隔触发且尚未跨过夜间窗口（如连接被重置后重入），
-    // 若仍在夜间则重新等待到 6:01
-    if (isNightWindow()) {
-        m_reconnectTimer->start(msecsToNextRetry());
-        return;
-    }
 
     emit logMessage(QStringLiteral("尝试重新连接..."), 0);
 
     switch (m_activeBackend) {
     case ActiveBackend::WiredEap:
     case ActiveBackend::PortalWifi:
-        // 重试前复判后端：重试间隔可达 5 分钟（或一夜），期间模式/SSID 白名单/
-        // 链路可能已变（拔了网线、改了联网方式、校园 Wi-Fi 更换）——不复判会让
-        // 过期的后端反复重连，白名单变更也迟迟不生效。
-        {
-            const auto decision = decideBackend();
-            if (decision.backend == ConnectionBuilder::AuthBackend::None) {
-                qWarning().noquote() << "auth backend undecided:" << decision.reason;
-                emit logMessage(QStringLiteral("等待网络就绪：插入网线或连接校园 Wi-Fi 后将自动认证..."), 0);
-                m_activeBackend = ActiveBackend::None;
-                restoreDhcp();   // 放弃有线意图：静态 IP 还给 DHCP（见 handleAuthFailed）
-                scheduleReconnect();
-                startAutoWait();
-                break;
-            }
-            // auto 模式：有线连续认证失败（≥2，常因交换机/端口不认证或环境暂不可用）
-            // 且 Wi-Fi 仍关联并命中白名单时，回退无线——避免"插了网线却断网"。用户手动
-            // 重连或有线成功（onEapSuccess）即清零；若后期线缆环境恢复，切回自动仍先试有线。
-            if (m_activeBackend == ActiveBackend::WiredEap
-                && m_connectMode == ConnectMode::Auto
-                && m_wiredFailStreak >= RetryPolicy::kWiredFallbackThreshold) {
-                // 外层守卫只为"不满足条件时省掉一次 wlanapi 查询"；判据本身在纯函数里
-                const WlanMedia::WlanInfo wlan = WlanMedia::currentWifiConnection();
-                if (m_debugLog)
-                    debugLog(QStringLiteral("重连复判：有线失败次数=%1（≥%2），准备回退无线")
-                                 .arg(m_wiredFailStreak).arg(RetryPolicy::kWiredFallbackThreshold));
-                RetryPolicy::WifiFallbackInput fb;
-                fb.autoMode        = (m_connectMode == ConnectMode::Auto);
-                fb.wiredFailStreak = m_wiredFailStreak;
-                fb.wifiConnected   = wlan.connected;
-                fb.ssidMatched     = ConnectionBuilder::ssidMatch(wlan.ssid, m_ssidWhitelist);
-                if (RetryPolicy::shouldFallbackToWifi(fb)) {
-                    emit logMessage(QStringLiteral("有线连续认证失败，自动回退无线认证..."), 1);
-                    restoreDhcp();   // 转无线：静态 IP 不再有意义，还给 DHCP
-                    m_activeBackend = ActiveBackend::PortalWifi;
-                    startWifiAuth();
-                    break;
-                }
-                // 切有线时通常已物理断开 Wi-Fi：无法自动回退，明确提示（继续按有线重试）
-                emit logMessage(QStringLiteral("有线认证失败，且未关联校园 Wi-Fi，无法自动回退无线"), 1);
-            }
-            const ActiveBackend desired = (decision.backend == ConnectionBuilder::AuthBackend::WiredEap)
-                                              ? ActiveBackend::WiredEap
-                                              : ActiveBackend::PortalWifi;
-            if (desired != m_activeBackend) {
-                // 后端切换（如 auto 下拔网线→无线）：无线进程在 Failed 后已空闲
-                // （无运行中定时器），新周期 start() 递增代数即可丢弃旧回调，无需 stop()。
-                // UDP 侧不在此处停：下面 desired==WiredEap 分支本就统一停一次
-                // （原先两处都停，同一路径上重复投递两次 stop）
-                if (desired == ActiveBackend::PortalWifi)
-                    restoreDhcp();   // 切无线：静态 IP 还给 DHCP
-                m_activeBackend = desired;
-            }
-            if (desired == ActiveBackend::WiredEap) {
-                // 走完整有线流程（而不是只 startAuth）：失败时已恢复 DHCP，静态 IP 必须
-                // 在这里重新应用；startWiredBackend 同时会在认证时刻重算 localIp/MAC
-                // 并解析 netsh 目标网卡（见其函数注释）。
-                // EAP 侧 start() 自身会 closeDevice + resetSessionState，等价于 restart()
-                // 的复位效果，不再依赖"队列 stop → 队列 start"的顺序契约。
-                stopUdpIfRunning();
-                startWiredBackend();
-            } else {
-                // 重新完整走无线流程（内部会先探测在线状态，已在线则直接回 Online）
-                startWifiAuth();
-            }
-        }
+        dispatchRetryWithKnownBackend();
         break;
-
     case ActiveBackend::None:
-        // auto 扫描态（无链路/SSID 不匹配）：重演一次决策，不重跑静态 IP（从未设置过）
-        {
-            const auto decision = decideBackend();
-            if (decision.backend == ConnectionBuilder::AuthBackend::None) {
-                qWarning().noquote() << "auth backend undecided:" << decision.reason;
-                emit logMessage(QStringLiteral("等待网络就绪：插入网线或连接校园 Wi-Fi 后将自动认证..."), 0);
-                restoreDhcp();
-                scheduleReconnect();
-                startAutoWait();
-                break;
-            }
-            m_activeBackend = (decision.backend == ConnectionBuilder::AuthBackend::WiredEap)
-                                  ? ActiveBackend::WiredEap
-                                  : ActiveBackend::PortalWifi;
-            // 有线一律走完整流程：等待期间静态 IP 已还给 DHCP（进入等待时 restoreDhcp），
-            // 这里必须重新应用，否则会出现"认证带着未配置的静态 IP 必然失败"
-            if (m_activeBackend == ActiveBackend::WiredEap)
-                startWiredBackend();
-            else
-                startWifiAuth();
-        }
+        dispatchRetryFromScanState();
         break;
+    }
+}
+
+// 重连前置检查：状态守卫 + 停就绪监听 + 夜间重判。
+// 返回 false 表示本次到点已被处理掉（不应继续重连）。
+bool SessionManager::reconnectPreflight()
+{
+    // 重连排程可能在两种状态下到点：Disconnected（含人工断开前的残留）与
+    // WaitingForNetwork（重试等待/就绪等待——UI 显示为可取消的等待）
+    if (m_state != AppConnectionState::Disconnected
+        && m_state != AppConnectionState::WaitingForNetwork)
+        return false;
+
+    stopAutoWait();   // 正式重试：停掉就绪监听（触发后由相应路径重新按需启动）
+
+    // 防御分支：定时器可能按旧间隔触发且尚未跨过夜间窗口（如连接被重置后重入），
+    // 若仍在夜间则重新等待到 6:01
+    if (isNightWindow()) {
+        m_reconnectTimer->start(msecsToNextRetry());
+        return false;
+    }
+    return true;
+}
+
+// 已有后端（有线/无线）时的重试分派：复判后端 -> （必要时）回退无线 -> 启动认证。
+void SessionManager::dispatchRetryWithKnownBackend()
+{
+    // 重试前复判后端：重试间隔可达 5 分钟（或一夜），期间模式/SSID 白名单/
+    // 链路可能已变（拔了网线、改了联网方式、校园 Wi-Fi 更换）——不复判会让
+    // 过期的后端反复重连，白名单变更也迟迟不生效。
+    const auto decision = decideBackend();
+    if (decision.backend == ConnectionBuilder::AuthBackend::None) {
+        qWarning().noquote() << "auth backend undecided:" << decision.reason;
+        emit logMessage(QStringLiteral("等待网络就绪：插入网线或连接校园 Wi-Fi 后将自动认证..."), 0);
+        m_activeBackend = ActiveBackend::None;
+        restoreDhcp();   // 放弃有线意图：静态 IP 还给 DHCP（见 handleAuthFailed）
+        scheduleReconnect();
+        startAutoWait();
+        return;
+    }
+
+    // auto 模式：有线连续认证失败（>=2，常因交换机/端口不认证或环境暂不可用）
+    // 且 Wi-Fi 仍关联并命中白名单时，回退无线——避免"插了网线却断网"。用户手动
+    // 重连或有线成功（onEapSuccess）即清零；若后期线缆环境恢复，切回自动仍先试有线。
+    if (m_activeBackend == ActiveBackend::WiredEap
+        && m_connectMode == ConnectMode::Auto
+        && m_wiredFailStreak >= RetryPolicy::kWiredFallbackThreshold) {
+        // 外层守卫只为"不满足条件时省掉一次 wlanapi 查询"；判据本身在纯函数里
+        const WlanMedia::WlanInfo wlan = WlanMedia::currentWifiConnection();
+        if (m_debugLog)
+            debugLog(QStringLiteral("重连复判：有线失败次数=%1（>=%2），准备回退无线")
+                         .arg(m_wiredFailStreak).arg(RetryPolicy::kWiredFallbackThreshold));
+        RetryPolicy::WifiFallbackInput fb;
+        fb.autoMode        = (m_connectMode == ConnectMode::Auto);
+        fb.wiredFailStreak = m_wiredFailStreak;
+        fb.wifiConnected   = wlan.connected;
+        fb.ssidMatched     = ConnectionBuilder::ssidMatch(wlan.ssid, m_ssidWhitelist);
+        if (RetryPolicy::shouldFallbackToWifi(fb)) {
+            emit logMessage(QStringLiteral("有线连续认证失败，自动回退无线认证..."), 1);
+            restoreDhcp();   // 转无线：静态 IP 不再有意义，还给 DHCP
+            m_activeBackend = ActiveBackend::PortalWifi;
+            startWifiAuth();
+            return;
+        }
+        // 切有线时通常已物理断开 Wi-Fi：无法自动回退，明确提示（继续按有线重试）
+        emit logMessage(QStringLiteral("有线认证失败，且未关联校园 Wi-Fi，无法自动回退无线"), 1);
+    }
+
+    const ActiveBackend desired = (decision.backend == ConnectionBuilder::AuthBackend::WiredEap)
+                                      ? ActiveBackend::WiredEap
+                                      : ActiveBackend::PortalWifi;
+    if (desired != m_activeBackend) {
+        // 后端切换（如 auto 下拔网线->无线）：无线进程在 Failed 后已空闲
+        // （无运行中定时器），新周期 start() 递增代数即可丢弃旧回调，无需 stop()。
+        // UDP 侧不在此处停：下面 desired==WiredEap 分支本就统一停一次
+        // （原先两处都停，同一路径上重复投递两次 stop）
+        if (desired == ActiveBackend::PortalWifi)
+            restoreDhcp();   // 切无线：静态 IP 还给 DHCP
+        m_activeBackend = desired;
+    }
+
+    launchForBackend();
+}
+
+// auto 扫描态（无链路 / SSID 不匹配）的重试分派：重演一次决策，不重跑静态 IP
+// （该状态下从未设置过静态 IP）。
+void SessionManager::dispatchRetryFromScanState()
+{
+    const auto decision = decideBackend();
+    if (decision.backend == ConnectionBuilder::AuthBackend::None) {
+        qWarning().noquote() << "auth backend undecided:" << decision.reason;
+        emit logMessage(QStringLiteral("等待网络就绪：插入网线或连接校园 Wi-Fi 后将自动认证..."), 0);
+        restoreDhcp();
+        scheduleReconnect();
+        startAutoWait();
+        return;
+    }
+    m_activeBackend = (decision.backend == ConnectionBuilder::AuthBackend::WiredEap)
+                          ? ActiveBackend::WiredEap
+                          : ActiveBackend::PortalWifi;
+    // 有线一律走完整流程：等待期间静态 IP 已还给 DHCP（进入等待时 restoreDhcp），
+    // 这里必须重新应用，否则会出现"认证带着未配置的静态 IP 必然失败"
+    launchForBackend();
+}
+
+// 按当前 m_activeBackend 启动对应认证流程。有线必须走 startWiredBackend
+// （而非裸 startAuth）：失败时已恢复 DHCP，静态 IP 需在此重新应用，且
+// startWiredBackend 会在认证时刻重算 localIp/MAC 与 netsh 目标网卡。
+void SessionManager::launchForBackend()
+{
+    if (m_activeBackend == ActiveBackend::WiredEap) {
+        stopUdpIfRunning();
+        startWiredBackend();
+    } else {
+        // 重新完整走无线流程（内部会先探测在线状态，已在线则直接回 Online）
+        startWifiAuth();
     }
 }

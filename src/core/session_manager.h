@@ -109,6 +109,11 @@ private slots:
     void onPurgeDone(bool clean, const QString& detail);
     void onHeartbeatFailed();
     void onReconnectTimeout();
+    // onReconnectTimeout 的分解（原 112 行单函数，按"预检 -> 决策 -> 分派"拆分）
+    bool reconnectPreflight();              // 状态守卫 + 停监听 + 夜间重判；false = 已处理
+    void dispatchRetryWithKnownBackend();   // 已有后端：复判 + 无线回退 + 启动
+    void dispatchRetryFromScanState();      // auto 扫描态：重演决策 + 启动
+    void launchForBackend();                // 按 m_activeBackend 启动有线/无线流程
     void onAutoStartDone(bool ok, const QString& error);
     // 无线 Portal 反馈
     void onWifiStateChanged(WifiAuthState state, const QString& message, bool retryable = true);
