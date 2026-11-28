@@ -93,6 +93,10 @@ private:
     bool processEapPacket(const QByteArray& packet);   // false = 致命错误，需 stop
     void handleEapRequest(const EAPHeader& hdr, const QByteArray& payload);
     void checkRetransmit();
+    // 轮询频率自适应：握手期 20ms，稳态 200ms（见 constants.h 的说明）。
+    // 收到 EAP-Request 立即升频；收到 EAP-Success 降频。
+    void ensureHandshakePolling();
+    void enterSteadyPolling();
 
     // 持锁期间缓冲的信号（按产生顺序发出，保持日志与状态变更的顺序）
     struct PendingSignal {
@@ -115,6 +119,8 @@ private:
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_stopRequested{false};
     std::atomic<bool> m_debugLog{false};   // 调试输出（帧级 hex）
+    // 当前是否处于稳态低频轮询（true = 200ms；false = 握手 20ms）
+    bool m_steadyPoll = false;
     AuthState m_currentState = AuthState::Idle;
 
     // start 代数：start()/stop()/restart() 各递增一次。所有异步延续

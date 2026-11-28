@@ -446,6 +446,8 @@ void EapProcess::start()
     m_running       = true;
     m_stopRequested = false;
     resetSessionState();
+    // 新会话必定从握手开始：无条件回到握手频率（上一次会话可能停在稳态）
+    m_steadyPoll = false;
 
     // 设备名从配置快照里取（用配置锁，与 m_mutex 无关）；随后放开 m_mutex 再开设备
     // —— pcap_open_live() 是可能阻塞数百 ms 的系统调用，锁内开设备会让主线程干等。
@@ -491,7 +493,7 @@ void EapProcess::start()
 
     if (!m_pollTimer) {
         m_pollTimer = new QTimer(this);
-        m_pollTimer->setInterval(20);
+        m_pollTimer->setInterval(EAP_POLL_INTERVAL_HANDSHAKE_MS);
         connect(m_pollTimer, &QTimer::timeout, this, &EapProcess::onPollTimeout);
     }
 
@@ -625,6 +627,9 @@ bool EapProcess::processEapPacket(const QByteArray& packet)
     }
 
     if (eapHeader.code == EAP_CODE_REQUEST) {
+        // 任何 EAP-Request（重认证 / 心跳探活）都必须以握手频率响应：先升频再处理，
+        // 否则本次响应后若还有后续交互，200ms 的间隔会累积成明显延迟。
+        ensureHandshakePolling();
         // 嗅探交换机 MAC（后续单播响应的目的地址）。只接受【合法 EAP-Request】的源地址：
         // 原先在解析前对任意非组播帧嗅探，同网段主机发一个伪造帧即可把后续响应引到它那里。
         if (!isMulticastMac(eth->src_mac))
@@ -644,6 +649,9 @@ bool EapProcess::processEapPacket(const QByteArray& packet)
             // 上线成功由 onEapSuccess 统一输出"认证成功，可以上网了！"，状态消息留空防重复
             deferState(AuthState::Authenticated, QString());
             deferEapSuccess(m_md5Result);
+            // 握手已完成 -> 降频。轮询仍需保留（交换机定期发 EAP-Request/Identity
+            // 探活，不回应会被踢下线），但不需要 50 Hz。
+            enterSteadyPolling();
         }
     } else if (eapHeader.code == EAP_CODE_FAILURE) {
         log(LogLevel::Error, QStringLiteral("认证被拒绝 (可能是冷却期，稍等1分钟再试)"));
@@ -720,6 +728,33 @@ void EapProcess::handleEapRequest(const EAPHeader& hdr, const QByteArray& payloa
                                     .arg(hdr.type, 2, 16, QLatin1Char('0')).toUpper());
         break;
     }
+}
+
+// 切到握手频率（20ms）。收到任何 EAP-Request 时调用：重认证 / 心跳探活都需要
+// 尽快响应，200ms 的稳态间隔会让多轮交互累积出可感知的延迟。
+void EapProcess::ensureHandshakePolling()
+{
+    if (!m_steadyPoll)
+        return;                    // 已在握手频率，无需切
+    m_steadyPoll = false;
+    if (m_pollTimer)
+        m_pollTimer->setInterval(EAP_POLL_INTERVAL_HANDSHAKE_MS);
+}
+
+// 切到稳态频率（200ms）。握手完成（收到 EAP-Success）后调用。
+//
+// 为什么稳态仍需轮询：交换机会定期发 EAP-Request/Identity 探活，不回应就会被
+// 判定掉线。轮询是维持在线状态的必要机制，不能停；但 50 Hz 对"等探活"来说
+// 过于频繁——实测 CPU 影响可忽略（单次 pcap_next_ex 约 1-2 微秒），真正的代价
+// 是每秒 50 次唤醒使 CPU 难以进入深层 C-state，对电池续航不利。
+// 200ms 相比 802.1X 的秒级重传超时仍有 5-10 倍余量。
+void EapProcess::enterSteadyPolling()
+{
+    if (m_steadyPoll)
+        return;
+    m_steadyPoll = true;
+    if (m_pollTimer)
+        m_pollTimer->setInterval(EAP_POLL_INTERVAL_STEADY_MS);
 }
 
 void EapProcess::checkRetransmit()
