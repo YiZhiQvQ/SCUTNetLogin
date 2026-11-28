@@ -5,6 +5,30 @@ CONFIG += c++17
 TARGET = SCUTNetLogin
 TEMPLATE = app
 
+# ============================================================================
+# 版本号单点定义
+# 改版本只改这一处：这里拆成三个整数宏供 app.rc 的 VERSIONINFO 使用，
+# 同时以 APP_VERSION 字符串形式供 main.cpp 设置 QApplication::applicationVersion()。
+# ============================================================================
+VERSION = 1.8.0
+APP_VERSION_PARTS = $$split(VERSION, ".")
+# 数值宏（供 app.rc 的 VERSIONINFO 与 main.cpp 用）
+DEFINES += APP_VERSION_MAJOR=$$member(APP_VERSION_PARTS, 0)
+DEFINES += APP_VERSION_MINOR=$$member(APP_VERSION_PARTS, 1)
+DEFINES += APP_VERSION_PATCH=$$member(APP_VERSION_PARTS, 2)
+# 字符串版本。注意两处使用方的引号需求不同：
+#   · app.rc 的 VERSIONINFO VALUE 语法需要**带引号**的字面量
+#   · main.cpp 用 QStringLiteral(APP_VERSION) 需要**不带引号**的宏值
+# 因此分别定义：APP_VERSION_QUOTED 给 rc，APP_VERSION 给 C++。
+# 注意：不能直接写 APP_VERSION=$$VERSION（=1.8.0 在 C++ 里是非法数字字面量）。
+# C++ 侧的版本字符串由主程序自行组合三段整数宏得到。
+
+# 版本号作为三段整数传入，供 rc 拼装字符串（避开 rc 不支持字符串化的限制，
+# 也避免 DEFINES 里的引号被 qmake 再转义一轮变成 ""1.8.0""）
+DEFINES += APP_VER_MAJOR=$$member(APP_VERSION_PARTS, 0)
+DEFINES += APP_VER_MINOR=$$member(APP_VERSION_PARTS, 1)
+DEFINES += APP_VER_PATCH=$$member(APP_VERSION_PARTS, 2)
+
 INCLUDEPATH += src
 
 # Npcap

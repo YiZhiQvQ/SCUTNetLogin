@@ -1,5 +1,56 @@
 #include <windows.h>
 IDI_ICON1 ICON "res/SCUTnetwork.ico"
+
+// ============================================================================
+// 版本资源。
+//
+// 为什么版本字符串是写死的字面量而不是从 .pro 传入：
+//   · rc 预处理器不支持 # 字符串化运算符（RC_STR(x) 之类全部报错）；
+//   · 而 DEFINES 里传带引号的宏会被 qmake 二次转义成 ""1.8.0""，rc 报 RC2133。
+// 因此数值部分由 .pro 的 APP_VER_MAJOR/MINOR/PATCH 传入（保证 FILEVERSION
+// 不会与 pro 脱节），字符串部分在此手写。
+//
+// 【改版本时】只需改 SCUTNetLogin.pro 的 VERSION，以及本文件下面两个
+// FileVersion / ProductVersion 字面量（二者必须与 pro 一致）。
+// ============================================================================
+#ifndef APP_VER_MAJOR
+#define APP_VER_MAJOR 0
+#endif
+#ifndef APP_VER_MINOR
+#define APP_VER_MINOR 0
+#endif
+#ifndef APP_VER_PATCH
+#define APP_VER_PATCH 0
+#endif
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    APP_VER_MAJOR,APP_VER_MINOR,APP_VER_PATCH,0
+ PRODUCTVERSION APP_VER_MAJOR,APP_VER_MINOR,APP_VER_PATCH,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "SCUTNetLogin"
+            VALUE "FileDescription",  "SCUT Campus Network Auth Client"
+            VALUE "FileVersion",      "1.8.0"
+            VALUE "InternalName",     "SCUTNetLogin"
+            VALUE "LegalCopyright",   "MIT License"
+            VALUE "OriginalFilename", "SCUTNetLogin.exe"
+            VALUE "ProductName",      "SCUT Campus Network Auth"
+            VALUE "ProductVersion",   "1.8.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
 // 嵌入管理员权限清单（标准模板，含正确引号）
 //
 // qmake 路径（.pro: CONFIG -= embed_manifest_exe + QMAKE_LFLAGS 引号问题）依赖

@@ -1,5 +1,17 @@
 #include "ui/mainwindow.h"
 #include <QApplication>
+
+// 版本号三段宏由 SCUTNetLogin.pro 的 VERSION 定义并传入。手工编译（如直接 cl）时
+// 没有这些宏，给 0.0.0 兜底，便于识别非 qmake 产物。
+#ifndef APP_VERSION_MAJOR
+#define APP_VERSION_MAJOR 0
+#endif
+#ifndef APP_VERSION_MINOR
+#define APP_VERSION_MINOR 0
+#endif
+#ifndef APP_VERSION_PATCH
+#define APP_VERSION_PATCH 0
+#endif
 #include <QMessageBox>
 #include <QSharedMemory>
 #include <QIcon>
@@ -26,6 +38,12 @@ int main(int argc, char* argv[]) {
     a.setApplicationName("SCUTNetLogin");
     a.setOrganizationName("SCUTNetLogin");   // QSettings 默认构造（UI 几何记忆）用；不影响 config.ini
     a.setApplicationDisplayName("SCUT 校园网认证");
+    // 版本号单点定义在 .pro（VERSION = x.y.z），以三段整数宏传入并用 QString::number
+    // 组合——不能直接用字符串宏（APP_VERSION=1.8.0 在 C++ 里是非法数字字面量）。
+    a.setApplicationVersion(QStringLiteral("%1.%2.%3")
+                                .arg(APP_VERSION_MAJOR)
+                                .arg(APP_VERSION_MINOR)
+                                .arg(APP_VERSION_PATCH));
 
     // 载入图标
     a.setWindowIcon(QIcon(":/SCUTnetwork.ico"));
